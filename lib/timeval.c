@@ -24,30 +24,47 @@
 
 #if defined(WIN32) && !defined(MSDOS)
 
-struct curltime Curl_now(void)
+static bool is_vista_or_greater(void)
 {
-  /*
-  ** GetTickCount() is available on _all_ Windows versions from W95 up
-  ** to nowadays. Returns milliseconds elapsed since last system boot,
-  ** increases monotonically and wraps once 49.7 days have elapsed.
-  */
-  struct curltime now;
-#if !defined(_WIN32_WINNT) || !defined(_WIN32_WINNT_VISTA) || \
-    (_WIN32_WINNT < _WIN32_WINNT_VISTA) || \
-    (defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
-  DWORD milliseconds = GetTickCount();
-  now.tv_sec = milliseconds / 1000;
-  now.tv_usec = (milliseconds % 1000) * 1000;
-#else
-  ULONGLONG milliseconds = GetTickCount64();
-  now.tv_sec = (time_t) (milliseconds / 1000);
-  now.tv_usec = (unsigned int) (milliseconds % 1000) * 1000;
-#endif
-
-  return now;
+  OSVERSIONINFOEXW osvi = { sizeof(osvi), 0, 0, 0, 0, {0}, 0, 0 };
+  const DWORDLONG conditionMask = VerSetConditionMask(
+      VerSetConditionMask(VerSetConditionMask(0, VER_MAJORVERSION,
+      VER_GREATER_EQUAL), VER_MINORVERSION, VER_GREATER_EQUAL),
+      VER_SERVICEPACKMAJOR, VER_GREATER_EQUAL);
+  osvi.dwMajorVersion = HIBYTE(_WIN32_WINNT_VISTA);
+  osvi.dwMinorVersion = LOBYTE(_WIN32_WINNT_VISTA);
+  osvi.wServicePackMajor = 0;
+  return FALSE != VerifyVersionInfoW(&osvi, VER_MAJORVERSION | VER_MINORVERSION
+    | VER_SERVICEPACKMAJOR, conditionMask);
 }
 
-#elif defined(HAVE_CLOCK_GETTIME_MONOTONIC)
+struct curltime Curl_now(void)
+{
+  static int is_vista = -1;
+  static LARGE_INTEGER freq;
+  struct curltime now;
+  if (is_vista == -1)
+  {
+    is_vista = is_vista_or_greater() ? 1 : 0;
+    if (is_vista == 1)
+      QueryPerformanceFrequency(&freq);
+  }
+  if (is_vista == 1) /* QPC timer might have issues pre-Vista */
+  {
+    LARGE_INTEGER count;
+    QueryPerformanceCounter(&count);
+    now.tv_sec = (time_t)(count.QuadPart / freq.QuadPart);
+    now.tv_usec = (int)((count.QuadPart % freq.QuadPart)
+	  * 1000000 / freq.QuadPart);
+  }
+  else
+  {
+    DWORD milliseconds = GetTickCount();
+    now.tv_sec = milliseconds / 1000;
+    now.tv_usec = (milliseconds % 1000) * 1000;
+  }
+  return now;
+}
 
 struct curltime Curl_now(void)
 {
