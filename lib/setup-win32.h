@@ -7,7 +7,7 @@
  *                            | (__| |_| |  _ <| |___
  *                             \___|\___/|_| \_\_____|
  *
- * Copyright (C) 1998 - 2021, Daniel Stenberg, <daniel@haxx.se>, et al.
+ * Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
  *
  * This software is licensed as described in the file COPYING, which
  * you should have received as part of this distribution. The terms
@@ -19,6 +19,8 @@
  *
  * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
  * KIND, either express or implied.
+ *
+ * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
 
@@ -35,19 +37,30 @@
 
 #ifdef HAVE_WINDOWS_H
 #  if defined(UNICODE) && !defined(_UNICODE)
-#    define _UNICODE
+#    error "UNICODE is defined but _UNICODE is not defined"
 #  endif
 #  if defined(_UNICODE) && !defined(UNICODE)
-#    define UNICODE
+#    error "_UNICODE is defined but UNICODE is not defined"
 #  endif
-#  include <winerror.h>
-#  include <windows.h>
+/*
+ * Don't include unneeded stuff in Windows headers to avoid compiler
+ * warnings and macro clashes.
+ * Make sure to define this macro before including any Windows headers.
+ */
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOGDI
+#    define NOGDI
+#  endif
 #  ifdef HAVE_WINSOCK2_H
 #    include <winsock2.h>
 #    ifdef HAVE_WS2TCPIP_H
 #      include <ws2tcpip.h>
 #    endif
 #  endif
+#  include <windows.h>
+#  include <winerror.h>
 #  include <tchar.h>
 #  ifdef UNICODE
      typedef wchar_t *(*curl_wcsdup_callback)(const wchar_t *str);
@@ -83,17 +96,11 @@
 #ifndef _WIN32_WINNT_WS03
 #define _WIN32_WINNT_WS03           0x0502   /* Windows Server 2003 */
 #endif
-#ifndef _WIN32_WINNT_WIN6
-#define _WIN32_WINNT_WIN6           0x0600   /* Windows Vista */
-#endif
 #ifndef _WIN32_WINNT_VISTA
 #define _WIN32_WINNT_VISTA          0x0600   /* Windows Vista */
 #endif
 #ifndef _WIN32_WINNT_WS08
 #define _WIN32_WINNT_WS08           0x0600   /* Windows Server 2008 */
-#endif
-#ifndef _WIN32_WINNT_LONGHORN
-#define _WIN32_WINNT_LONGHORN       0x0600   /* Windows Vista */
 #endif
 #ifndef _WIN32_WINNT_WIN7
 #define _WIN32_WINNT_WIN7           0x0601   /* Windows 7 */
@@ -103,9 +110,6 @@
 #endif
 #ifndef _WIN32_WINNT_WINBLUE
 #define _WIN32_WINNT_WINBLUE        0x0603   /* Windows 8.1 */
-#endif
-#ifndef _WIN32_WINNT_WINTHRESHOLD
-#define _WIN32_WINNT_WINTHRESHOLD   0x0A00   /* Windows 10 */
 #endif
 #ifndef _WIN32_WINNT_WIN10
 #define _WIN32_WINNT_WIN10          0x0A00   /* Windows 10 */

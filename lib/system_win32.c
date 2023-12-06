@@ -5,7 +5,7 @@
  *                            | (__| |_| |  _ <| |___
  *                             \___|\___/|_| \_\_____|
  *
- * Copyright (C) 2016 - 2021, Steve Holme, <steve_holme@hotmail.com>.
+ * Copyright (C) Steve Holme, <steve_holme@hotmail.com>.
  *
  * This software is licensed as described in the file COPYING, which
  * you should have received as part of this distribution. The terms
@@ -18,11 +18,13 @@
  * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
  * KIND, either express or implied.
  *
+ * SPDX-License-Identifier: curl
+ *
  ***************************************************************************/
 
 #include "curl_setup.h"
 
-#if defined(WIN32)
+#if defined(_WIN32)
 
 #include <curl/curl.h>
 #include "system_win32.h"
@@ -36,6 +38,7 @@
 
 LARGE_INTEGER Curl_freq;
 bool Curl_isVistaOrGreater;
+bool Curl_isWindows8OrGreater;
 
 /* Handle of iphlpapp.dll */
 static HMODULE s_hIpHlpApiDll = NULL;
@@ -110,6 +113,13 @@ CURLcode Curl_win32_init(long flags)
   }
   else
     Curl_isVistaOrGreater = FALSE;
+
+  if(curlx_verify_windows_version(6, 2, 0, PLATFORM_WINNT,
+                                  VERSION_GREATER_THAN_EQUAL)) {
+    Curl_isWindows8OrGreater = TRUE;
+  }
+  else
+    Curl_isWindows8OrGreater = FALSE;
 
   QueryPerformanceFrequency(&Curl_freq);
   return CURLE_OK;
@@ -236,4 +246,4 @@ HMODULE Curl_load_library(LPCTSTR filename)
 #endif
 }
 
-#endif /* WIN32 */
+#endif /* _WIN32 */

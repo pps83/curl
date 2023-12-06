@@ -1,5 +1,5 @@
-#ifndef HEADER_CURL_DOTDOT_H
-#define HEADER_CURL_DOTDOT_H
+#ifndef HEADER_CURL_H1_PROXY_H
+#define HEADER_CURL_H1_PROXY_H
 /***************************************************************************
  *                                  _   _ ____  _
  *  Project                     ___| | | |  _ \| |
@@ -7,7 +7,7 @@
  *                            | (__| |_| |  _ <| |___
  *                             \___|\___/|_| \_\_____|
  *
- * Copyright (C) 1998 - 2020, Daniel Stenberg, <daniel@haxx.se>, et al.
+ * Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
  *
  * This software is licensed as described in the file COPYING, which
  * you should have received as part of this distribution. The terms
@@ -20,6 +20,20 @@
  * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
  * KIND, either express or implied.
  *
+ * SPDX-License-Identifier: curl
+ *
  ***************************************************************************/
-char *Curl_dedotdotify(const char *input);
-#endif /* HEADER_CURL_DOTDOT_H */
+
+#include "curl_setup.h"
+
+#if !defined(CURL_DISABLE_PROXY) && !defined(CURL_DISABLE_HTTP)
+
+CURLcode Curl_cf_h1_proxy_insert_after(struct Curl_cfilter *cf,
+                                       struct Curl_easy *data);
+
+extern struct Curl_cftype Curl_cft_h1_proxy;
+
+
+#endif /* !CURL_DISABLE_PROXY && !CURL_DISABLE_HTTP */
+
+#endif /* HEADER_CURL_H1_PROXY_H */

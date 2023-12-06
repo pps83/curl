@@ -1,5 +1,5 @@
-#ifndef HEADER_CURL_GSKIT_H
-#define HEADER_CURL_GSKIT_H
+#ifndef HEADER_CURL_MACOS_H
+#define HEADER_CURL_MACOS_H
 /***************************************************************************
  *                                  _   _ ____  _
  *  Project                     ___| | | |  _ \| |
@@ -7,7 +7,7 @@
  *                            | (__| |_| |  _ <| |___
  *                             \___|\___/|_| \_\_____|
  *
- * Copyright (C) 1998 - 2020, Daniel Stenberg, <daniel@haxx.se>, et al.
+ * Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
  *
  * This software is licensed as described in the file COPYING, which
  * you should have received as part of this distribution. The terms
@@ -20,19 +20,20 @@
  * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
  * KIND, either express or implied.
  *
+ * SPDX-License-Identifier: curl
+ *
  ***************************************************************************/
+
 #include "curl_setup.h"
 
-/*
- * This header should only be needed to get included by vtls.c and gskit.c
- */
+#ifdef CURL_MACOS_CALL_COPYPROXIES
 
-#include "urldata.h"
+CURLcode Curl_macos_init(void);
 
-#ifdef USE_GSKIT
+#else
 
-extern const struct Curl_ssl Curl_ssl_gskit;
+#define Curl_macos_init() CURLE_OK
 
-#endif /* USE_GSKIT */
+#endif
 
-#endif /* HEADER_CURL_GSKIT_H */
+#endif /* HEADER_CURL_MACOS_H */

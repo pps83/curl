@@ -5,7 +5,7 @@
  *                            | (__| |_| |  _ <| |___
  *                             \___|\___/|_| \_\_____|
  *
- * Copyright (C) 1998 - 2021, Daniel Stenberg, <daniel@haxx.se>, et al.
+ * Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
  *
  * This software is licensed as described in the file COPYING, which
  * you should have received as part of this distribution. The terms
@@ -17,6 +17,8 @@
  *
  * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
  * KIND, either express or implied.
+ *
+ * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
 
@@ -42,19 +44,17 @@
 #include <inet.h>
 #endif
 
-#if defined(USE_THREADS_POSIX)
-#  ifdef HAVE_PTHREAD_H
-#    include <pthread.h>
-#  endif
-#elif defined(USE_THREADS_WIN32)
-#  ifdef HAVE_PROCESS_H
-#    include <process.h>
-#  endif
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#define MAX_URL_LENGTH 256
+/* set in win32_init() */
+extern bool Curl_isWindows8OrGreater;
 #endif
 
-#if (defined(NETWARE) && defined(__NOVELL_LIBC__))
-#undef in_addr_t
-#define in_addr_t unsigned long
+#if defined(USE_THREADS_POSIX) && defined(HAVE_PTHREAD_H)
+#  include <pthread.h>
 #endif
 
 #ifdef HAVE_GETADDRINFO
@@ -73,7 +73,6 @@
 #include "inet_ntop.h"
 #include "curl_threads.h"
 #include "connect.h"
-#include "socketpair.h"
 /* The last 3 #include files should be in this order */
 #include "curl_printf.h"
 #include "curl_memory.h"
@@ -146,7 +145,7 @@ static void destroy_async_data(struct Curl_async *);
  */
 void Curl_resolver_cancel(struct Curl_easy *data)
 {
-  destroy_async_data(&data->state.async);
+  destroy_async_data(&data->conn->resolve_async);
 }
 
 /* This function is used to init a threaded resolve */
@@ -154,9 +153,24 @@ static bool init_resolve_thread(struct Curl_easy *data,
                                 const char *hostname, int port,
                                 const struct addrinfo *hints);
 
+#if (_WIN32_WINNT >= 0x0600)
+/* Thread sync data used for GetAddrInfoExW  for win8+ */
+struct thread_sync_data_w8
+{
+    OVERLAPPED overlapped;
+    ADDRINFOEXW *res;
+    HANDLE cancel_ev;
+    WCHAR name[256]; /* max domain name is 253 chars */
+    WCHAR service_name[20]; /* port */
+    ADDRINFOEXW hints;
+};
+#endif
 
 /* Data for synchronization between resolver thread and its parent */
 struct thread_sync_data {
+#if (_WIN32_WINNT >= 0x0600)
+  struct thread_sync_data_w8 w8;
+#endif
   curl_mutex_t *mtx;
   int done;
   int port;
@@ -175,6 +189,9 @@ struct thread_sync_data {
 };
 
 struct thread_data {
+#if (_WIN32_WINNT >= 0x0600)
+  HANDLE complete_ev;
+#endif
   curl_thread_t thread_hnd;
   unsigned int poll_interval;
   timediff_t interval_end;
@@ -183,7 +200,7 @@ struct thread_data {
 
 static struct thread_sync_data *conn_thread_sync_data(struct Curl_easy *data)
 {
-  return &(data->state.async.tdata->tsd);
+  return &(data->conn->resolve_async.tdata->tsd);
 }
 
 /* Destroy resolver thread synchronization data */
@@ -206,7 +223,7 @@ void destroy_thread_sync_data(struct thread_sync_data *tsd)
    * the other end (for reading) is always closed in the parent thread.
    */
   if(tsd->sock_pair[1] != CURL_SOCKET_BAD) {
-    sclose(tsd->sock_pair[1]);
+    wakeup_close(tsd->sock_pair[1]);
   }
 #endif
   memset(tsd, 0, sizeof(*tsd));
@@ -243,8 +260,8 @@ int init_thread_sync_data(struct thread_data *td,
   Curl_mutex_init(tsd->mtx);
 
 #ifndef CURL_DISABLE_SOCKETPAIR
-  /* create socket pair, avoid AF_LOCAL since it doesn't build on Solaris */
-  if(Curl_socketpair(AF_UNIX, SOCK_STREAM, 0, &tsd->sock_pair[0]) < 0) {
+  /* create socket pair or pipe */
+  if(wakeup_create(&tsd->sock_pair[0]) < 0) {
     tsd->sock_pair[0] = CURL_SOCKET_BAD;
     tsd->sock_pair[1] = CURL_SOCKET_BAD;
     goto err_exit;
@@ -261,26 +278,169 @@ int init_thread_sync_data(struct thread_data *td,
 
   return 1;
 
- err_exit:
-  /* Memory allocation failed */
+err_exit:
+#ifndef CURL_DISABLE_SOCKETPAIR
+  if(tsd->sock_pair[0] != CURL_SOCKET_BAD) {
+    wakeup_close(tsd->sock_pair[0]);
+    tsd->sock_pair[0] = CURL_SOCKET_BAD;
+  }
+#endif
   destroy_thread_sync_data(tsd);
   return 0;
 }
 
-static int getaddrinfo_complete(struct Curl_easy *data)
+static CURLcode getaddrinfo_complete(struct Curl_easy *data)
 {
   struct thread_sync_data *tsd = conn_thread_sync_data(data);
-  int rc;
+  CURLcode result;
 
-  rc = Curl_addrinfo_callback(data, tsd->sock_error, tsd->res);
+  result = Curl_addrinfo_callback(data, tsd->sock_error, tsd->res);
   /* The tsd->res structure has been copied to async.dns and perhaps the DNS
      cache.  Set our copy to NULL so destroy_thread_sync_data doesn't free it.
   */
   tsd->res = NULL;
 
-  return rc;
+  return result;
 }
 
+
+#if (_WIN32_WINNT >= 0x0600)
+static VOID WINAPI
+query_complete(DWORD err, DWORD bytes, LPOVERLAPPED overlapped)
+{
+  (void)bytes;
+#ifndef CURL_DISABLE_SOCKETPAIR
+  char buf[1];
+#endif
+  const ADDRINFOEXW* ai;
+  struct Curl_addrinfo* cafirst = NULL;
+  struct Curl_addrinfo* calast = NULL;
+  struct Curl_addrinfo* ca;
+  size_t ss_size;
+  int error = (int)err;
+  struct thread_sync_data* tsd =
+    CONTAINING_RECORD(overlapped, struct thread_sync_data, w8.overlapped);
+  struct thread_data* td = tsd->td;
+  const ADDRINFOEXW* res = tsd->w8.res;
+
+  if(error == ERROR_SUCCESS) {
+    /* traverse the addrinfo list */
+  
+    for(ai = res; ai != NULL; ai = ai->ai_next) {
+      size_t namelen = ai->ai_canonname ? wcslen(ai->ai_canonname) + 1 : 0;
+      /* ignore elements with unsupported address family, */
+      /* settle family-specific sockaddr structure size.  */
+      if(ai->ai_family == AF_INET)
+        ss_size = sizeof(struct sockaddr_in);
+#ifdef ENABLE_IPV6
+      else if(ai->ai_family == AF_INET6)
+        ss_size = sizeof(struct sockaddr_in6);
+#endif
+      else
+        continue;
+  
+      /* ignore elements without required address info */
+      if(!ai->ai_addr || !(ai->ai_addrlen > 0))
+        continue;
+  
+      /* ignore elements with bogus address size */
+      if((size_t)ai->ai_addrlen < ss_size)
+        continue;
+  
+      ca = malloc(sizeof(struct Curl_addrinfo) + ss_size + namelen);
+      if(!ca) {
+        error = EAI_MEMORY;
+        break;
+      }
+  
+      /* copy each structure member individually, member ordering, */
+      /* size, or padding might be different for each platform.    */
+      ca->ai_flags     = ai->ai_flags;
+      ca->ai_family    = ai->ai_family;
+      ca->ai_socktype  = ai->ai_socktype;
+      ca->ai_protocol  = ai->ai_protocol;
+      ca->ai_addrlen   = (curl_socklen_t)ss_size;
+      ca->ai_addr      = NULL;
+      ca->ai_canonname = NULL;
+      ca->ai_next      = NULL;
+  
+      ca->ai_addr = (void *)((char *)ca + sizeof(struct Curl_addrinfo));
+      memcpy(ca->ai_addr, ai->ai_addr, ss_size);
+  
+      if(namelen) {
+        ca->ai_canonname = (void *)((char *)ca->ai_addr + ss_size);
+        sprintf(ca->ai_canonname, "%S", ai->ai_canonname);
+      }
+  
+      /* if the return list is empty, this becomes the first element */
+      if(!cafirst)
+        cafirst = ca;
+  
+      /* add this element last in the return list */
+      if(calast)
+        calast->ai_next = ca;
+      calast = ca;
+    }
+  
+    /* if we failed, also destroy the Curl_addrinfo list */
+    if(error) {
+      Curl_freeaddrinfo(cafirst);
+      cafirst = NULL;
+    }
+    else if(!cafirst) {
+#ifdef EAI_NONAME
+      /* rfc3493 conformant */
+      error = EAI_NONAME;
+#else
+      /* rfc3493 obsoleted */
+      error = EAI_NODATA;
+#endif
+#ifdef USE_WINSOCK
+      SET_SOCKERRNO(error);
+#endif
+    }
+    tsd->res = cafirst;
+  }
+
+  if(tsd->w8.res) {
+    FreeAddrInfoExW(tsd->w8.res);
+    tsd->w8.res = NULL;
+  }
+
+  if(error) {
+    tsd->sock_error = SOCKERRNO?SOCKERRNO:error;
+    if(tsd->sock_error == 0)
+      tsd->sock_error = RESOLVER_ENOMEM;
+  }
+  else {
+    Curl_addrinfo_set_port(tsd->res, tsd->port);
+  }
+
+  Curl_mutex_acquire(tsd->mtx);
+  if(tsd->done) {
+    /* too late, gotta clean up the mess */
+    Curl_mutex_release(tsd->mtx);
+    destroy_thread_sync_data(tsd);
+    free(td);
+  }
+  else {
+#ifndef CURL_DISABLE_SOCKETPAIR
+    if(tsd->sock_pair[1] != CURL_SOCKET_BAD) {
+      /* DNS has been resolved, signal client task */
+      buf[0] = 1;
+      if(swrite(tsd->sock_pair[1],  buf, sizeof(buf)) < 0) {
+        /* update sock_erro to errno */
+        tsd->sock_error = SOCKERRNO;
+      }
+    }
+#endif
+    tsd->done = 1;
+    Curl_mutex_release(tsd->mtx);
+    if(td->complete_ev != NULL)
+      SetEvent(td->complete_ev); /* Notify caller that the query completed */
+  }
+}
+#endif
 
 #ifdef HAVE_GETADDRINFO
 
@@ -325,7 +485,7 @@ static unsigned int CURL_STDCALL getaddrinfo_thread(void *arg)
     if(tsd->sock_pair[1] != CURL_SOCKET_BAD) {
       /* DNS has been resolved, signal client task */
       buf[0] = 1;
-      if(swrite(tsd->sock_pair[1],  buf, sizeof(buf)) < 0) {
+      if(wakeup_write(tsd->sock_pair[1],  buf, sizeof(buf)) < 0) {
         /* update sock_erro to errno */
         tsd->sock_error = SOCKERRNO;
       }
@@ -396,9 +556,21 @@ static void destroy_async_data(struct Curl_async *async)
     Curl_mutex_release(td->tsd.mtx);
 
     if(!done) {
+#if (_WIN32_WINNT >= 0x0600)
+      if(td->complete_ev != NULL)
+        CloseHandle(td->complete_ev);
+      else
+#endif
       Curl_thread_destroy(td->thread_hnd);
     }
     else {
+#if (_WIN32_WINNT >= 0x0600)
+      if(td->complete_ev != NULL) {
+        GetAddrInfoExCancel(&td->tsd.w8.cancel_ev);
+        WaitForSingleObject(td->complete_ev, INFINITE);
+        CloseHandle(td->complete_ev);
+      }
+#endif
       if(td->thread_hnd != curl_thread_t_null)
         Curl_thread_join(&td->thread_hnd);
 
@@ -433,9 +605,9 @@ static bool init_resolve_thread(struct Curl_easy *data,
 {
   struct thread_data *td = calloc(1, sizeof(struct thread_data));
   int err = ENOMEM;
-  struct Curl_async *asp = &data->state.async;
+  struct Curl_async *asp = &data->conn->resolve_async;
 
-  data->state.async.tdata = td;
+  data->conn->resolve_async.tdata = td;
   if(!td)
     goto errno_exit;
 
@@ -444,6 +616,9 @@ static bool init_resolve_thread(struct Curl_easy *data,
   asp->status = 0;
   asp->dns = NULL;
   td->thread_hnd = curl_thread_t_null;
+#if (_WIN32_WINNT >= 0x0600)
+  td->complete_ev = NULL;
+#endif
 
   if(!init_thread_sync_data(td, hostname, port, hints)) {
     asp->tdata = NULL;
@@ -458,6 +633,24 @@ static bool init_resolve_thread(struct Curl_easy *data,
 
   /* The thread will set this to 1 when complete. */
   td->tsd.done = 0;
+
+#if (_WIN32_WINNT >= 0x0600)
+  if(Curl_isWindows8OrGreater) {
+    wsprintfW(td->tsd.w8.name, L"%S", hostname);
+    wsprintfW(td->tsd.w8.service_name, L"%d", port);
+    td->tsd.w8.hints.ai_family = hints->ai_family;
+    td->tsd.w8.hints.ai_socktype = hints->ai_socktype;
+    td->complete_ev = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if(td->complete_ev != NULL) {
+      err = GetAddrInfoExW(td->tsd.w8.name, td->tsd.w8.service_name, NS_DNS,
+        NULL, &td->tsd.w8.hints, &td->tsd.w8.res, NULL,
+        &td->tsd.w8.overlapped, &query_complete, &td->tsd.w8.cancel_ev);
+      if(err != WSA_IO_PENDING)
+        query_complete(err, 0, &td->tsd.w8.overlapped);
+      return TRUE;
+    }
+  }
+#endif
 
 #ifdef HAVE_GETADDRINFO
   td->thread_hnd = Curl_thread_create(getaddrinfo_thread, &td->tsd);
@@ -474,10 +667,10 @@ static bool init_resolve_thread(struct Curl_easy *data,
 
   return TRUE;
 
- err_exit:
+err_exit:
   destroy_async_data(asp);
 
- errno_exit:
+errno_exit:
   errno = err;
   return FALSE;
 }
@@ -493,11 +686,20 @@ static CURLcode thread_wait_resolv(struct Curl_easy *data,
   CURLcode result = CURLE_OK;
 
   DEBUGASSERT(data);
-  td = data->state.async.tdata;
+  td = data->conn->resolve_async.tdata;
   DEBUGASSERT(td);
   DEBUGASSERT(td->thread_hnd != curl_thread_t_null);
 
   /* wait for the thread to resolve the name */
+#if (_WIN32_WINNT >= 0x0600)
+  if(td->complete_ev != NULL) {
+    WaitForSingleObject(td->complete_ev, INFINITE);
+    CloseHandle(td->complete_ev);
+    if(entry)
+      result = getaddrinfo_complete(data);
+  }
+  else
+#endif
   if(Curl_thread_join(&td->thread_hnd)) {
     if(entry)
       result = getaddrinfo_complete(data);
@@ -505,18 +707,18 @@ static CURLcode thread_wait_resolv(struct Curl_easy *data,
   else
     DEBUGASSERT(0);
 
-  data->state.async.done = TRUE;
+  data->conn->resolve_async.done = TRUE;
 
   if(entry)
-    *entry = data->state.async.dns;
+    *entry = data->conn->resolve_async.dns;
 
-  if(!data->state.async.dns && report)
+  if(!data->conn->resolve_async.dns && report)
     /* a name was not resolved, report error */
     result = Curl_resolver_error(data);
 
-  destroy_async_data(&data->state.async);
+  destroy_async_data(&data->conn->resolve_async);
 
-  if(!data->state.async.dns && report)
+  if(!data->conn->resolve_async.dns && report)
     connclose(data->conn, "asynch resolve failed");
 
   return result;
@@ -529,12 +731,13 @@ static CURLcode thread_wait_resolv(struct Curl_easy *data,
  */
 void Curl_resolver_kill(struct Curl_easy *data)
 {
-  struct thread_data *td = data->state.async.tdata;
+  struct thread_data *td = data->conn->resolve_async.tdata;
 
   /* If we're still resolving, we must wait for the threads to fully clean up,
      unfortunately.  Otherwise, we can simply cancel to clean up any resolver
      data. */
-  if(td && td->thread_hnd != curl_thread_t_null)
+  if(td && td->thread_hnd != curl_thread_t_null
+     && (data->set.quick_exit != 1L))
     (void)thread_wait_resolv(data, NULL, FALSE);
   else
     Curl_resolver_cancel(data);
@@ -567,7 +770,7 @@ CURLcode Curl_resolver_wait_resolv(struct Curl_easy *data,
 CURLcode Curl_resolver_is_resolved(struct Curl_easy *data,
                                    struct Curl_dns_entry **entry)
 {
-  struct thread_data *td = data->state.async.tdata;
+  struct thread_data *td = data->conn->resolve_async.tdata;
   int done = 0;
 
   DEBUGASSERT(entry);
@@ -585,13 +788,13 @@ CURLcode Curl_resolver_is_resolved(struct Curl_easy *data,
   if(done) {
     getaddrinfo_complete(data);
 
-    if(!data->state.async.dns) {
+    if(!data->conn->resolve_async.dns) {
       CURLcode result = Curl_resolver_error(data);
-      destroy_async_data(&data->state.async);
+      destroy_async_data(&data->conn->resolve_async);
       return result;
     }
-    destroy_async_data(&data->state.async);
-    *entry = data->state.async.dns;
+    destroy_async_data(&data->conn->resolve_async);
+    *entry = data->conn->resolve_async.dns;
   }
   else {
     /* poll for name lookup done with exponential backoff up to 250ms */
@@ -623,9 +826,9 @@ int Curl_resolver_getsock(struct Curl_easy *data, curl_socket_t *socks)
   int ret_val = 0;
   timediff_t milli;
   timediff_t ms;
-  struct resdata *reslv = (struct resdata *)data->state.async.resolver;
+  struct resdata *reslv = (struct resdata *)data->conn->resolve_async.resolver;
 #ifndef CURL_DISABLE_SOCKETPAIR
-  struct thread_data *td = data->state.async.tdata;
+  struct thread_data *td = data->conn->resolve_async.tdata;
 #else
   (void)socks;
 #endif
@@ -666,7 +869,7 @@ struct Curl_addrinfo *Curl_resolver_getaddrinfo(struct Curl_easy *data,
                                                 int port,
                                                 int *waitp)
 {
-  struct resdata *reslv = (struct resdata *)data->state.async.resolver;
+  struct resdata *reslv = (struct resdata *)data->conn->resolve_async.resolver;
 
   *waitp = 0; /* default to synchronous response */
 
@@ -695,14 +898,18 @@ struct Curl_addrinfo *Curl_resolver_getaddrinfo(struct Curl_easy *data,
 {
   struct addrinfo hints;
   int pf = PF_INET;
-  struct resdata *reslv = (struct resdata *)data->state.async.resolver;
+  struct resdata *reslv = (struct resdata *)data->conn->resolve_async.resolver;
 
   *waitp = 0; /* default to synchronous response */
 
 #ifdef CURLRES_IPV6
-  if(Curl_ipv6works(data))
+  if((data->conn->ip_version != CURL_IPRESOLVE_V4) && Curl_ipv6works(data)) {
     /* The stack seems to be IPv6-enabled */
-    pf = PF_UNSPEC;
+    if(data->conn->ip_version == CURL_IPRESOLVE_V6)
+      pf = PF_INET6;
+    else
+      pf = PF_UNSPEC;
+  }
 #endif /* CURLRES_IPV6 */
 
   memset(&hints, 0, sizeof(hints));

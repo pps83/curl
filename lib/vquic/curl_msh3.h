@@ -1,3 +1,5 @@
+#ifndef HEADER_CURL_VQUIC_CURL_MSH3_H
+#define HEADER_CURL_VQUIC_CURL_MSH3_H
 /***************************************************************************
  *                                  _   _ ____  _
  *  Project                     ___| | | |  _ \| |
@@ -5,7 +7,7 @@
  *                            | (__| |_| |  _ <| |___
  *                             \___|\___/|_| \_\_____|
  *
- * Copyright (C) 1998 - 2020, Daniel Stenberg, <daniel@haxx.se>, et al.
+ * Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
  *
  * This software is licensed as described in the file COPYING, which
  * you should have received as part of this distribution. The terms
@@ -18,56 +20,27 @@
  * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
  * KIND, either express or implied.
  *
+ * SPDX-License-Identifier: curl
+ *
  ***************************************************************************/
 
 #include "curl_setup.h"
 
-#ifndef CURL_DISABLE_FTP
+#ifdef USE_MSH3
 
-#include "wildcard.h"
-#include "llist.h"
-#include "fileinfo.h"
-/* The last 3 #include files should be in this order */
-#include "curl_printf.h"
-#include "curl_memory.h"
-#include "memdebug.h"
+#include <msh3.h>
 
-static void fileinfo_dtor(void *user, void *element)
-{
-  (void)user;
-  Curl_fileinfo_cleanup(element);
-}
+void Curl_msh3_ver(char *p, size_t len);
 
-CURLcode Curl_wildcard_init(struct WildcardData *wc)
-{
-  Curl_llist_init(&wc->filelist, fileinfo_dtor);
-  wc->state = CURLWC_INIT;
+CURLcode Curl_cf_msh3_create(struct Curl_cfilter **pcf,
+                             struct Curl_easy *data,
+                             struct connectdata *conn,
+                             const struct Curl_addrinfo *ai);
 
-  return CURLE_OK;
-}
+bool Curl_conn_is_msh3(const struct Curl_easy *data,
+                       const struct connectdata *conn,
+                       int sockindex);
 
-void Curl_wildcard_dtor(struct WildcardData *wc)
-{
-  if(!wc)
-    return;
+#endif /* USE_MSQUIC */
 
-  if(wc->dtor) {
-    wc->dtor(wc->protdata);
-    wc->dtor = ZERO_NULL;
-    wc->protdata = NULL;
-  }
-  DEBUGASSERT(wc->protdata == NULL);
-
-  Curl_llist_destroy(&wc->filelist, NULL);
-
-
-  free(wc->path);
-  wc->path = NULL;
-  free(wc->pattern);
-  wc->pattern = NULL;
-
-  wc->customptr = NULL;
-  wc->state = CURLWC_INIT;
-}
-
-#endif /* if disabled */
+#endif /* HEADER_CURL_VQUIC_CURL_MSH3_H */
