@@ -416,7 +416,7 @@ query_complete(DWORD err, DWORD bytes, LPWSAOVERLAPPED overlapped)
  * and wait on it.
  */
 static
-#if defined(_WIN32_WCE) || defined(CURL_WINDOWS_UWP)
+#if defined(CURL_WINDOWS_UWP) || defined(UNDER_CE)
 DWORD
 #else
 unsigned int
@@ -475,7 +475,7 @@ CURL_STDCALL getaddrinfo_thread(void *arg)
  * gethostbyname_thread() resolves a name and then exits.
  */
 static
-#if defined(_WIN32_WCE) || defined(CURL_WINDOWS_UWP)
+#if defined(CURL_WINDOWS_UWP) || defined(UNDER_CE)
 DWORD
 #else
 unsigned int
@@ -690,7 +690,7 @@ err_exit:
   destroy_async_data(data);
 
 errno_exit:
-  errno = err;
+  CURL_SETERRNO(err);
   return FALSE;
 }
 
