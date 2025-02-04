@@ -55,20 +55,19 @@ struct thread_sync_data {
   struct thread_sync_data_w8 w8;
 #endif
   curl_mutex_t *mtx;
-  bool done;
-  int port;
   char *hostname;        /* hostname to resolve, Curl_async.hostname
                             duplicate */
 #ifndef CURL_DISABLE_SOCKETPAIR
-  struct Curl_easy *data;
   curl_socket_t sock_pair[2]; /* eventfd/pipes/socket pair */
 #endif
-  int sock_error;
   struct Curl_addrinfo *res;
 #ifdef HAVE_GETADDRINFO
   struct addrinfo hints;
 #endif
   struct thread_data *td; /* for thread-self cleanup */
+  int port;
+  int sock_error;
+  bool done;
 };
 
 struct thread_data {
