@@ -64,7 +64,6 @@ struct thread_sync_data {
 #ifdef HAVE_GETADDRINFO
   struct addrinfo hints;
 #endif
-  struct thread_data *td; /* for thread-self cleanup */
   int port;
   int sock_error;
   bool done;
@@ -82,6 +81,7 @@ struct thread_data {
   struct Curl_https_rrinfo hinfo;
   ares_channel channel;
 #endif
+  bool init;
 };
 
 #elif defined(CURLRES_ARES) /* CURLRES_THREADED */
@@ -97,7 +97,7 @@ struct thread_data {
 #ifdef USE_HTTPSRR
   struct Curl_https_rrinfo hinfo;
 #endif
-  char hostname[1];
+  char *hostname;
 };
 
 #endif /* CURLRES_ARES */
