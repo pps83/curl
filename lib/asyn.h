@@ -54,9 +54,9 @@ struct thread_sync_data {
 #ifdef _WIN32
   struct thread_sync_data_w8 w8;
 #endif
-  curl_mutex_t *mtx;
   char *hostname;        /* hostname to resolve, Curl_async.hostname
                             duplicate */
+  curl_mutex_t mutx;
 #ifndef CURL_DISABLE_SOCKETPAIR
   curl_socket_t sock_pair[2]; /* eventfd/pipes/socket pair */
 #endif
