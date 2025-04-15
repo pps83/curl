@@ -27,6 +27,7 @@ CONFIGURE_OPTS="        \
 --disable-manual        \
 --disable-docs          \
 --disable-unix-sockets  \
+--disable-ipfs          \
 "
 
 # Check if MSYSTEM is set to "MSYS"
