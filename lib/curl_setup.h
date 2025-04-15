@@ -125,7 +125,11 @@
 
 #include "curl_config.h"
 
-#else /* HAVE_CONFIG_H */
+#else /* !HAVE_CONFIG_H */
+
+#ifdef __MSYS__
+#  include "config-msys.h"
+#endif
 
 #ifdef _WIN32_WCE
 #  include "config-win32ce.h"
