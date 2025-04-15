@@ -1,0 +1,131 @@
+#!/bin/sh
+
+# Configure options
+CONFIGURE_OPTS="        \
+--enable-static         \
+--disable-shared        \
+--disable-debug         \
+--with-zlib             \
+--with-zstd             \
+--with-openssl          \
+--without-libpsl        \
+--without-libgsasl      \
+--disable-ftp           \
+--disable-file          \
+--disable-ldap          \
+--disable-ldaps         \
+--disable-rtsp          \
+--disable-dict          \
+--disable-telnet        \
+--disable-tftp          \
+--disable-pop3          \
+--disable-imap          \
+--disable-smb           \
+--disable-smtp          \
+--disable-gopher        \
+--disable-mqtt          \
+--disable-manual        \
+--disable-docs          \
+--disable-unix-sockets  \
+"
+
+# Check if running in MSYS or Cygwin
+if [ "$MSYSTEM" = "MSYS" ] || [[ "$(uname -s)" =~ ^CYGWIN ]]; then
+    : # Do nothing, we're in the right environment
+else
+    echo "Error: This script must be run in MSYS or Cygwin environment" >&2
+    exit 1
+fi
+
+# Check if configure exists, run autoreconf if not
+if [ ! -f "configure" ]; then
+    echo "configure script not found, running autoreconf..."
+    if ! autoreconf -fi; then
+        echo "Error: autoreconf failed" >&2
+        exit 1
+    fi
+fi
+
+# Run configure script with options
+echo "Running ./configure with options..."
+if ! ./configure $CONFIGURE_OPTS; then
+    echo "Error: ./configure failed" >&2
+    exit 1
+fi
+
+# Rename curl_config.h to config-msys.h
+echo "Renaming lib/curl_config.h to lib/config-msys.h..."
+if [ ! -f "lib/curl_config.h" ]; then
+    echo "Error: lib/curl_config.h not found" >&2
+    exit 1
+fi
+
+mv -f "lib/curl_config.h" "lib/config-msys.h" || {
+    echo "Error: Failed to rename lib/curl_config.h" >&2
+    exit 1
+}
+
+# Get LIBCURL_VERSION_NUM from curlver.h
+if [ ! -f "include/curl/curlver.h" ]; then
+    echo "Error: include/curl/curlver.h not found" >&2
+    exit 1
+fi
+
+VERSION_NUM=$(grep -E '^#define LIBCURL_VERSION_NUM ' include/curl/curlver.h | awk '{print $3}')
+if [ -z "$VERSION_NUM" ]; then
+    echo "Error: Could not extract LIBCURL_VERSION_NUM from curlver.h" >&2
+    exit 1
+fi
+# Add version check to config-msys.h
+echo "Adding version check to lib/config-msys.h..."
+{
+    echo ""
+    echo "/* Version check - ensure this config matches the curl version */"
+    echo "#include <curl/curlver.h>"
+    echo "#if LIBCURL_VERSION_NUM != $VERSION_NUM"
+    echo "#error LIBCURL_VERSION_NUM mismatch. Re-run configure-msys"
+    echo "#endif"
+} >> "lib/config-msys.h" || {
+    echo "Error: Failed to add version check to config-msys.h" >&2
+    exit 1
+}
+
+# Update curl_setup.h
+echo "Updating lib/curl_setup.h..."
+if [ ! -f "lib/curl_setup.h" ]; then
+    echo "Error: lib/curl_setup.h not found" >&2
+    exit 1
+fi
+
+# Create a temporary file for the modified content
+tmpfile=$(mktemp) || {
+    echo "Error: Failed to create temporary file" >&2
+    exit 1
+}
+
+# Use awk to perform the exact replacement
+awk '
+    /#else \/\* HAVE_CONFIG_H \*\// {
+        print "#else /* !HAVE_CONFIG_H */"
+        print ""
+        print "#ifdef __CYGWIN__"
+        print "#  include \"config-msys.h\""
+        print "#endif"
+        next
+    }
+    { print }
+' "lib/curl_setup.h" > "$tmpfile" || {
+    echo "Error: Failed to process lib/curl_setup.h" >&2
+    rm -f "$tmpfile"
+    exit 1
+}
+
+# Replace the original file with the modified version
+mv -f "$tmpfile" "lib/curl_setup.h" || {
+    echo "Error: Failed to update lib/curl_setup.h" >&2
+    rm -f "$tmpfile"
+    exit 1
+}
+
+echo "Successfully configured for MSYS"
+exit 0
