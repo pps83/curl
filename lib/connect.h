@@ -32,6 +32,8 @@
 struct Curl_dns_entry;
 struct ip_quadruple;
 
+enum alpnid Curl_alpn2alpnid(const char *name, size_t len);
+
 /* generic function that returns how much time there is left to run, according
    to the timeouts set */
 timediff_t Curl_timeleft(struct Curl_easy *data,
@@ -43,7 +45,7 @@ timediff_t Curl_timeleft(struct Curl_easy *data,
 #define DEFAULT_SHUTDOWN_TIMEOUT_MS   (2 * 1000)
 
 void Curl_shutdown_start(struct Curl_easy *data, int sockindex,
-                         struct curltime *nowp);
+                         int timeout_ms, struct curltime *nowp);
 
 /* return how much time there is left to shutdown the connection at
  * sockindex. Returns 0 if there is no limit or shutdown has not started. */
@@ -71,9 +73,6 @@ curl_socket_t Curl_getconnectinfo(struct Curl_easy *data,
 
 bool Curl_addr2string(struct sockaddr *sa, curl_socklen_t salen,
                       char *addr, int *port);
-
-void Curl_persistconninfo(struct Curl_easy *data, struct connectdata *conn,
-                          struct ip_quadruple *ip);
 
 /*
  * Curl_conncontrol() marks the end of a connection/stream. The 'closeit'

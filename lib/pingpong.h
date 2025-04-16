@@ -69,7 +69,8 @@ struct pingpong {
 
   CURLcode (*statemachine)(struct Curl_easy *data, struct connectdata *conn);
   bool (*endofresp)(struct Curl_easy *data, struct connectdata *conn,
-                    char *ptr, size_t len, int *code);
+                    const char *ptr, size_t len, int *code);
+  BIT(initialised);
 };
 
 #define PINGPONG_SETUP(pp,s,e)                   \
@@ -137,6 +138,8 @@ CURLcode Curl_pp_readresp(struct Curl_easy *data,
                           int *code, /* return the server code if done */
                           size_t *size); /* size of the response */
 
+bool Curl_pp_needs_flush(struct Curl_easy *data,
+                         struct pingpong *pp);
 
 CURLcode Curl_pp_flushsend(struct Curl_easy *data,
                            struct pingpong *pp);

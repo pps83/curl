@@ -217,7 +217,7 @@ static CURLproxycode socks_state_send(struct Curl_cfilter *cf,
   CURLcode result;
 
   nwritten = Curl_conn_cf_send(cf->next, data, (char *)sx->outp,
-                               sx->outstanding, &result);
+                               sx->outstanding, FALSE, &result);
   if(nwritten <= 0) {
     if(CURLE_AGAIN == result) {
       return CURLPX_OK;
@@ -286,7 +286,7 @@ static CURLproxycode do_SOCKS4(struct Curl_cfilter *cf,
 {
   struct connectdata *conn = cf->conn;
   const bool protocol4a =
-    (conn->socks_proxy.proxytype == CURLPROXY_SOCKS4A) ? TRUE : FALSE;
+    (conn->socks_proxy.proxytype == CURLPROXY_SOCKS4A);
   unsigned char *socksreq = sx->buffer;
   CURLcode result;
   CURLproxycode presult;
@@ -344,7 +344,7 @@ static CURLproxycode do_SOCKS4(struct Curl_cfilter *cf,
     dns = Curl_fetch_addr(data, sx->hostname, conn->primary.remote_port);
 
     if(dns) {
-#ifdef CURLRES_ASYNCH
+#ifdef USE_CURL_ASYNC
       data->state.async.dns = dns;
       data->state.async.done = TRUE;
 #endif
@@ -388,7 +388,7 @@ CONNECT_RESOLVED:
 
         infof(data, "SOCKS4 connect to IPv4 %s (locally resolved)", buf);
 
-        Curl_resolv_unlock(data, dns); /* not used anymore from now on */
+        Curl_resolv_unlink(data, &dns); /* not used anymore from now on */
       }
       else
         failf(data, "SOCKS4 connection to %s not supported", sx->hostname);
@@ -512,7 +512,7 @@ CONNECT_REQ_INIT:
   /* Result */
   switch(socksreq[1]) {
   case 90:
-    infof(data, "SOCKS4%s request granted.", protocol4a?"a":"");
+    infof(data, "SOCKS4%s request granted.", protocol4a ? "a" : "");
     break;
   case 91:
     failf(data,
@@ -583,14 +583,13 @@ static CURLproxycode do_SOCKS5(struct Curl_cfilter *cf,
   CURLcode result;
   CURLproxycode presult;
   bool socks5_resolve_local =
-    (conn->socks_proxy.proxytype == CURLPROXY_SOCKS5) ? TRUE : FALSE;
+    (conn->socks_proxy.proxytype == CURLPROXY_SOCKS5);
   const size_t hostname_len = strlen(sx->hostname);
   size_t len = 0;
   const unsigned char auth = data->set.socks5auth;
   bool allow_gssapi = FALSE;
   struct Curl_dns_entry *dns = NULL;
 
-  DEBUGASSERT(auth & (CURLAUTH_BASIC | CURLAUTH_GSSAPI));
   switch(sx->state) {
   case CONNECT_SOCKS_INIT:
     if(conn->bits.httpproxy)
@@ -815,7 +814,7 @@ CONNECT_REQ_INIT:
     dns = Curl_fetch_addr(data, sx->hostname, sx->remote_port);
 
     if(dns) {
-#ifdef CURLRES_ASYNCH
+#ifdef USE_CURL_ASYNC
       data->state.async.dns = dns;
       data->state.async.done = TRUE;
 #endif
@@ -893,7 +892,7 @@ CONNECT_RESOLVED:
       failf(data, "SOCKS5 connection to %s not supported", dest);
     }
 
-    Curl_resolv_unlock(data, dns); /* not used anymore from now on */
+    Curl_resolv_unlink(data, &dns); /* not used anymore from now on */
     goto CONNECT_REQ_SEND;
   }
 CONNECT_RESOLVE_REMOTE:
@@ -912,7 +911,7 @@ CONNECT_RESOLVE_REMOTE:
 #ifdef USE_IPV6
       if(conn->bits.ipv6_ip) {
         char ip6[16];
-        if(1 != Curl_inet_pton(AF_INET6, sx->hostname, ip6))
+        if(1 != curlx_inet_pton(AF_INET6, sx->hostname, ip6))
           return CURLPX_BAD_ADDRESS_TYPE;
         socksreq[len++] = 4;
         memcpy(&socksreq[len], ip6, sizeof(ip6));
@@ -920,7 +919,7 @@ CONNECT_RESOLVE_REMOTE:
       }
       else
 #endif
-      if(1 == Curl_inet_pton(AF_INET, sx->hostname, ip4)) {
+      if(1 == curlx_inet_pton(AF_INET, sx->hostname, ip4)) {
         socksreq[len++] = 1;
         memcpy(&socksreq[len], ip4, sizeof(ip4));
         len += sizeof(ip4);
@@ -1128,7 +1127,7 @@ static void socks_proxy_cf_free(struct Curl_cfilter *cf)
 */
 static CURLcode socks_proxy_cf_connect(struct Curl_cfilter *cf,
                                        struct Curl_easy *data,
-                                       bool blocking, bool *done)
+                                       bool *done)
 {
   CURLcode result;
   struct connectdata *conn = cf->conn;
@@ -1140,7 +1139,7 @@ static CURLcode socks_proxy_cf_connect(struct Curl_cfilter *cf,
     return CURLE_OK;
   }
 
-  result = cf->next->cft->do_connect(cf->next, data, blocking, done);
+  result = cf->next->cft->do_connect(cf->next, data, done);
   if(result || !*done)
     return result;
 

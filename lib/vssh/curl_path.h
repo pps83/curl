@@ -1,5 +1,5 @@
-#ifndef HEADER_CURL_STRTOK_H
-#define HEADER_CURL_STRTOK_H
+#ifndef HEADER_CURL_PATH_H
+#define HEADER_CURL_PATH_H
 /***************************************************************************
  *                                  _   _ ____  _
  *  Project                     ___| | | |  _ \| |
@@ -23,14 +23,14 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+
 #include "curl_setup.h"
-#include <stddef.h>
+#include <curl/curl.h>
+#include "urldata.h"
 
-#ifndef HAVE_STRTOK_R
-char *Curl_strtok_r(char *s, const char *delim, char **last);
-#define strtok_r Curl_strtok_r
-#else
-#include <string.h>
-#endif
+CURLcode Curl_getworkingpath(struct Curl_easy *data,
+                             char *homedir,
+                             char **path);
 
-#endif /* HEADER_CURL_STRTOK_H */
+CURLcode Curl_get_pathname(const char **cpp, char **path, const char *homedir);
+#endif /* HEADER_CURL_PATH_H */
