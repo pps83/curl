@@ -37,6 +37,19 @@ struct Curl_dns_entry;
 #ifdef CURLRES_THREADED
 #include "curl_threads.h"
 
+#ifdef _WIN32
+#include "system_win32.h"
+
+/* Thread sync data used by GetAddrInfoExW for win8+ */
+struct thread_sync_data_w8
+{
+    OVERLAPPED overlapped;
+    ADDRINFOEXW_* res;
+    HANDLE cancel_ev;
+    ADDRINFOEXW_ hints;
+};
+#endif
+
 /* Data for synchronization between resolver thread and its parent */
 struct thread_sync_data {
   char *hostname;        /* hostname to resolve, Curl_async.hostname
@@ -48,6 +61,9 @@ struct thread_sync_data {
   struct Curl_addrinfo *res;
 #ifdef HAVE_GETADDRINFO
   struct addrinfo hints;
+#endif
+#ifdef _WIN32
+  struct thread_sync_data_w8 w8;
 #endif
   int port;
   int sock_error;
@@ -61,6 +77,9 @@ struct thread_data {
   struct curltime start;
   struct thread_sync_data tsd;
   CURLcode result; /* CURLE_OK or error handling response */
+#ifdef _WIN32
+  HANDLE complete_ev;
+#endif
 #if defined(USE_HTTPSRR) && defined(USE_ARES)
   struct Curl_https_rrinfo hinfo;
   ares_channel channel;
