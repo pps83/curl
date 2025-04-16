@@ -37,8 +37,23 @@ struct Curl_dns_entry;
 #ifdef CURLRES_THREADED
 #include "curl_threads.h"
 
+#ifdef _WIN32
+#include "system_win32.h"
+/* Thread sync data used by GetAddrInfoExW for win8+ */
+struct thread_sync_data_w8
+{
+  OVERLAPPED overlapped;
+  ADDRINFOEXW_ *res;
+  HANDLE cancel_ev;
+  ADDRINFOEXW_ hints;
+};
+#endif
+
 /* Data for synchronization between resolver thread and its parent */
 struct thread_sync_data {
+#ifdef _WIN32
+  struct thread_sync_data_w8 w8;
+#endif
   curl_mutex_t *mtx;
   char *hostname;        /* hostname to resolve, Curl_async.hostname
                             duplicate */
@@ -56,6 +71,9 @@ struct thread_sync_data {
 };
 
 struct thread_data {
+#ifdef _WIN32
+  HANDLE complete_ev;
+#endif
   curl_thread_t thread_hnd;
   unsigned int poll_interval;
   timediff_t interval_end;
