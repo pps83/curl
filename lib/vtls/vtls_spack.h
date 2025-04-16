@@ -1,5 +1,5 @@
-#ifndef HEADER_CURL_PATH_H
-#define HEADER_CURL_PATH_H
+#ifndef HEADER_CURL_VTLS_SPACK_H
+#define HEADER_CURL_VTLS_SPACK_H
 /***************************************************************************
  *                                  _   _ ____  _
  *  Project                     ___| | | |  _ \| |
@@ -23,27 +23,21 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-
 #include "curl_setup.h"
-#include <curl/curl.h>
-#include "urldata.h"
 
-#ifdef _WIN32
-#  undef  PATH_MAX
-#  define PATH_MAX MAX_PATH
-#  ifndef R_OK
-#    define R_OK 4
-#  endif
-#endif
+#ifdef USE_SSLS_EXPORT
 
-#ifndef PATH_MAX
-#define PATH_MAX 1024 /* just an extra precaution since there are systems that
-                         have their definition hidden well */
-#endif
+struct dynbuf;
+struct Curl_ssl_session;
 
-CURLcode Curl_getworkingpath(struct Curl_easy *data,
-                             char *homedir,
-                             char **path);
+CURLcode Curl_ssl_session_pack(struct Curl_easy *data,
+                               struct Curl_ssl_session *s,
+                               struct dynbuf *buf);
 
-CURLcode Curl_get_pathname(const char **cpp, char **path, const char *homedir);
-#endif /* HEADER_CURL_PATH_H */
+CURLcode Curl_ssl_session_unpack(struct Curl_easy *data,
+                                 const unsigned char *buf, size_t buflen,
+                                 struct Curl_ssl_session **ps);
+
+#endif /* USE_SSLS_EXPORT */
+
+#endif /* HEADER_CURL_VTLS_SPACK_H */
