@@ -1,10 +1,12 @@
 /* lib/curl_config.h.  Generated from curl_config.h.in by configure.  */
 /* lib/curl_config.h.in.  Generated from configure.ac by autoheader.  */
 
+/* !checksrc! disable COPYRIGHT all */
+
 /* Location of default ca bundle */
 /* #undef CURL_CA_BUNDLE */
 
-/* define "1" to use built-in CA store of SSL library */
+/* define "1" to use OpenSSL's built-in CA store */
 /* #undef CURL_CA_FALLBACK */
 
 /* Location of default ca path */
@@ -154,8 +156,11 @@
 /* Definition to make a library symbol externally visible. */
 #define CURL_EXTERN_SYMBOL __attribute__((__visibility__("default")))
 
+/* MIT Kerberos version */
+/* #undef CURL_KRB5_VERSION */
+
 /* cpu-machine-OS */
-#define CURL_OS "x86_64-pc-msys"
+#define CURL_OS "x86_64-pc-cygwin"
 
 /* built with multiple SSL backends */
 /* #undef CURL_WITH_MULTI_SSL */
@@ -165,9 +170,6 @@
 
 /* Define to 1 if you have the 'accept4' function. */
 #define HAVE_ACCEPT4 1
-
-/* Define to 1 if symbol `ADDRESS_FAMILY' exists */
-/* #undef HAVE_ADDRESS_FAMILY */
 
 /* Define to 1 if you have the alarm function. */
 #define HAVE_ALARM 1
@@ -188,10 +190,10 @@
 #define HAVE_BOOL_T 1
 
 /* if BROTLI is in use */
-/* #undef HAVE_BROTLI */
+#define HAVE_BROTLI 1
 
 /* Define to 1 if you have the <brotli/decode.h> header file. */
-/* #undef HAVE_BROTLI_DECODE_H */
+#define HAVE_BROTLI_DECODE_H 1
 
 /* Define to 1 if you have the __builtin_available function. */
 /* #undef HAVE_BUILTIN_AVAILABLE */
@@ -211,6 +213,9 @@
 
 /* Define to 1 if you have the fseeko declaration */
 #define HAVE_DECL_FSEEKO 1
+
+/* if you have the function DES_ecb_encrypt */
+#define HAVE_DES_ECB_ENCRYPT 1
 
 /* if you have <dirent.h> */
 #define HAVE_DIRENT_H 1
@@ -311,6 +316,9 @@
 /* if you have the function gnutls_srp_verifier */
 /* #undef HAVE_GNUTLS_SRP */
 
+/* Define to 1 if you have the <gsasl.h> header file. */
+/* #undef HAVE_GSASL_H */
+
 /* if you have GSS-API libraries */
 /* #undef HAVE_GSSAPI */
 
@@ -335,10 +343,10 @@
 /* Define to 1 if you have the 'if_nametoindex' function. */
 #define HAVE_IF_NAMETOINDEX 1
 
-/* Define to 1 if you have a IPv6 capable working inet_ntop function. */
+/* Define to 1 if you have an IPv6 capable working inet_ntop function. */
 #define HAVE_INET_NTOP 1
 
-/* Define to 1 if you have a IPv6 capable working inet_pton function. */
+/* Define to 1 if you have an IPv6 capable working inet_pton function. */
 #define HAVE_INET_PTON 1
 
 /* Define to 1 if you have the <inttypes.h> header file. */
@@ -385,7 +393,7 @@
 /* #undef HAVE_LDAP_URL_PARSE */
 
 /* Define to 1 if you have the 'brotlidec' library (-lbrotlidec). */
-/* #undef HAVE_LIBBROTLIDEC */
+#define HAVE_LIBBROTLIDEC 1
 
 /* Define to 1 if you have the <libgen.h> header file. */
 #define HAVE_LIBGEN_H 1
@@ -408,9 +416,6 @@
 /* Define to 1 if you have the 'ssl' library (-lssl). */
 #define HAVE_LIBSSL 1
 
-/* Define to 1 if you have the 'wolfssh' library (-lwolfssh). */
-/* #undef HAVE_LIBWOLFSSH */
-
 /* if zlib is available */
 #define HAVE_LIBZ 1
 
@@ -429,14 +434,14 @@
 /* Define to 1 if you have the 'mach_absolute_time' function. */
 /* #undef HAVE_MACH_ABSOLUTE_TIME */
 
+/* Define to 1 if you have the 'mbedtls_des_crypt_ecb' function. */
+/* #undef HAVE_MBEDTLS_DES_CRYPT_ECB */
+
 /* Define to 1 if you have the memrchr function or macro. */
 #define HAVE_MEMRCHR 1
 
 /* Define to 1 if you have the MSG_NOSIGNAL flag. */
 #define HAVE_MSG_NOSIGNAL 1
-
-/* Define to 1 if you have the <msh3.h> header file. */
-/* #undef HAVE_MSH3_H */
 
 /* Define to 1 if you have the <netdb.h> header file. */
 #define HAVE_NETDB_H 1
@@ -467,10 +472,6 @@
 
 /* Define to 1 if you have the <ngtcp2/ngtcp2.h> header file. */
 /* #undef HAVE_NGTCP2_NGTCP2_H */
-
-/* if you have an old MIT Kerberos version, lacking GSS_C_NT_HOSTBASED_SERVICE
-   */
-/* #undef HAVE_OLD_GSSMIT */
 
 /* if you have opendir */
 #define HAVE_OPENDIR 1
@@ -590,6 +591,9 @@
 /* Define to 1 if you have the 'SSL_set1_ech_config_list' function. */
 /* #undef HAVE_SSL_SET1_ECH_CONFIG_LIST */
 
+/* Define to 1 if you have the 'SSL_set_quic_tls_cbs' function. */
+#define HAVE_SSL_SET_QUIC_TLS_CBS 1
+
 /* Define to 1 if you have the 'SSL_set_quic_use_legacy_codepoint' function.
    */
 /* #undef HAVE_SSL_SET_QUIC_USE_LEGACY_CODEPOINT */
@@ -663,17 +667,11 @@
 /* Define to 1 if you have the <sys/select.h> header file. */
 #define HAVE_SYS_SELECT_H 1
 
-/* Define to 1 if you have the <sys/socket.h> header file. */
-#define HAVE_SYS_SOCKET_H 1
-
 /* Define to 1 if you have the <sys/sockio.h> header file. */
 /* #undef HAVE_SYS_SOCKIO_H */
 
 /* Define to 1 if you have the <sys/stat.h> header file. */
 #define HAVE_SYS_STAT_H 1
-
-/* Define to 1 if you have the <sys/time.h> header file. */
-#define HAVE_SYS_TIME_H 1
 
 /* Define to 1 if you have the <sys/types.h> header file. */
 #define HAVE_SYS_TYPES_H 1
@@ -714,23 +712,24 @@
 /* Define to 1 if you have the <uv.h> header file. */
 /* #undef HAVE_UV_H */
 
-/* Define to 1 if you have the <wolfssh/ssh.h> header file. */
-/* #undef HAVE_WOLFSSH_SSH_H */
+/* Define to 1 if you have the 'wolfSSL_BIO_new' function. */
+/* #undef HAVE_WOLFSSL_BIO_NEW */
 
-/* if you have wolfSSL_BIO_new */
-/* #undef HAVE_WOLFSSL_BIO */
+/* Define to 1 if you have the 'wolfSSL_BIO_set_shutdown' function. */
+/* #undef HAVE_WOLFSSL_BIO_SET_SHUTDOWN */
 
 /* Define to 1 if you have the 'wolfSSL_CTX_GenerateEchConfig' function. */
 /* #undef HAVE_WOLFSSL_CTX_GENERATEECHCONFIG */
 
-/* if you have wolfSSL_DES_ecb_encrypt */
+/* Define to 1 if you have the 'wolfSSL_DES_ecb_encrypt' function. */
 /* #undef HAVE_WOLFSSL_DES_ECB_ENCRYPT */
-
-/* if you have wolfSSL_BIO_set_shutdown */
-/* #undef HAVE_WOLFSSL_FULL_BIO */
 
 /* Define to 1 if you have the 'wolfSSL_get_peer_certificate' function. */
 /* #undef HAVE_WOLFSSL_GET_PEER_CERTIFICATE */
+
+/* Define to 1 if you have the 'wolfSSL_set_quic_use_legacy_codepoint'
+   function. */
+/* #undef HAVE_WOLFSSL_SET_QUIC_USE_LEGACY_CODEPOINT */
 
 /* Define to 1 if you have the 'wolfSSL_UseALPN' function. */
 /* #undef HAVE_WOLFSSL_USEALPN */
@@ -758,6 +757,9 @@
 
 /* Define to 1 if _THREAD_SAFE preprocessor symbol must be defined. */
 /* #undef NEED_THREAD_SAFE */
+
+/* openssl with new QUIC API */
+/* #undef OPENSSL_QUIC_API2 */
 
 /* Name of package */
 #define PACKAGE "curl"
@@ -815,11 +817,11 @@
 /* if AppleIDN */
 /* #undef USE_APPLE_IDN */
 
+/* enable Apple OS certificate validation */
+/* #undef USE_APPLE_SECTRUST */
+
 /* Define to enable c-ares support */
 /* #undef USE_ARES */
-
-/* if BearSSL is enabled */
-/* #undef USE_BEARSSL */
 
 /* if ECH support is available */
 /* #undef USE_ECH */
@@ -854,9 +856,6 @@
 /* if mbedTLS is enabled */
 /* #undef USE_MBEDTLS */
 
-/* if msh3 is in use */
-/* #undef USE_MSH3 */
-
 /* if nghttp2 is in use */
 /* #undef USE_NGHTTP2 */
 
@@ -883,9 +882,6 @@
 
 /* to enable Windows native SSL/TLS support */
 /* #undef USE_SCHANNEL */
-
-/* enable Secure Transport */
-/* #undef USE_SECTRANSP */
 
 /* if SSL session export support is available */
 /* #undef USE_SSLS_EXPORT */
@@ -922,9 +918,6 @@
 /* to enable SSPI support */
 /* #undef USE_WINDOWS_SSPI */
 
-/* if wolfSSH is in use */
-/* #undef USE_WOLFSSH */
-
 /* if wolfSSL is enabled */
 /* #undef USE_WOLFSSL */
 
@@ -959,6 +952,6 @@
 
 /* Version check - ensure this config matches the curl version */
 #include <curl/curlver.h>
-#if LIBCURL_VERSION_NUM != 0x080d01
+#if LIBCURL_VERSION_NUM != 0x081100
 #error LIBCURL_VERSION_NUM mismatch. Re-run configure-msys
 #endif
