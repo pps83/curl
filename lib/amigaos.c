@@ -184,7 +184,7 @@ int Curl_amiga_select(int nfds, fd_set *readfds, fd_set *writefds,
 {
   int r = WaitSelect(nfds, readfds, writefds, errorfds, timeout, 0);
   /* Ensure Ctrl-C signal is actioned */
-  if((r == -1) && (SOCKERRNO == EINTR))
+  if((r == -1) && (SOCKERRNO == SOCKEINTR))
     raise(SIGINT);
   return r;
 }
@@ -199,8 +199,9 @@ struct Library *SocketBase = NULL;
 
 #ifdef __libnix__
 void __request(const char *msg);
+#define CURL_AMIGA_REQUEST(msg)  __request(msg)
 #else
-# define __request(msg)       Printf((const unsigned char *)(msg "\n\a"), 0)
+#define CURL_AMIGA_REQUEST(msg)  Printf((const unsigned char *)(msg "\n\a"), 0)
 #endif
 
 void Curl_amiga_cleanup(void)
@@ -217,14 +218,14 @@ CURLcode Curl_amiga_init(void)
     SocketBase = OpenLibrary((const unsigned char *)"bsdsocket.library", 4);
 
   if(!SocketBase) {
-    __request("No TCP/IP Stack running!");
+    CURL_AMIGA_REQUEST("No TCP/IP Stack running!");
     return CURLE_FAILED_INIT;
   }
 
-  if(SocketBaseTags(SBTM_SETVAL(SBTC_ERRNOPTR(sizeof(errno))), (ULONG) &errno,
-                    SBTM_SETVAL(SBTC_LOGTAGPTR), (ULONG) "curl",
+  if(SocketBaseTags(SBTM_SETVAL(SBTC_ERRNOPTR(sizeof(errno))), (ULONG)&errno,
+                    SBTM_SETVAL(SBTC_LOGTAGPTR), (ULONG)"curl",
                     TAG_DONE)) {
-    __request("SocketBaseTags ERROR");
+    CURL_AMIGA_REQUEST("SocketBaseTags ERROR");
     return CURLE_FAILED_INIT;
   }
 
