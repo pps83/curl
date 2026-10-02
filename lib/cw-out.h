@@ -23,10 +23,9 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-
 #include "curl_setup.h"
 
-#include "sendf.h"
+struct Curl_easy;
 
 /**
  * The client writer type "cw-out" that does the actual writing to
@@ -34,16 +33,6 @@
  * client writer stack of a transfer.
  */
 extern const struct Curl_cwtype Curl_cwt_out;
-
-/**
- * Return TRUE iff 'cw-out' client write has paused data.
- */
-bool Curl_cw_out_is_paused(struct Curl_easy *data);
-
-/**
- * Flush any buffered date to the client, chunk collation still applies.
- */
-CURLcode Curl_cw_out_unpause(struct Curl_easy *data);
 
 /**
  * Mark EndOfStream reached and flush ALL data to the client.

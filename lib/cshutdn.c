@@ -22,10 +22,7 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-
 #include "curl_setup.h"
-
-#include <curl/curl.h>
 
 #include "urldata.h"
 #include "url.h"
@@ -33,33 +30,34 @@
 #include "progress.h"
 #include "multiif.h"
 #include "multi_ev.h"
-#include "sendf.h"
+#include "curl_trc.h"
 #include "cshutdn.h"
-#include "http_negotiate.h"
-#include "http_ntlm.h"
 #include "sigpipe.h"
 #include "connect.h"
 #include "select.h"
 #include "curlx/strparse.h"
 
-/* The last 2 #include files should be in this order */
-#include "curl_memory.h"
-#include "memdebug.h"
 
+struct cshutdn *Curl_cshutdn_get(struct Curl_easy *data)
+{
+  if(data && data->multi)
+    return &data->multi->cshutdn;
+  return NULL;
+}
 
 static void cshutdn_run_conn_handler(struct Curl_easy *data,
                                      struct connectdata *conn)
 {
   if(!conn->bits.shutdown_handler) {
 
-    if(conn->handler && conn->handler->disconnect) {
+    if(conn->scheme && conn->scheme->run->disconnect) {
       /* Some disconnect handlers do a blocking wait on server responses.
        * FTP/IMAP/SMTP and SFTP are among them. When using the internal
        * handle, set an overall short timeout so we do not hang for the
        * default 120 seconds. */
       if(data->state.internal) {
         data->set.timeout = DEFAULT_SHUTDOWN_TIMEOUT_MS;
-        (void)Curl_pgrsTime(data, TIMER_STARTOP);
+        Curl_pgrsTime(data, TIMER_STARTOP);
       }
 
       /* This is set if protocol-specific cleanups should be made */
@@ -68,7 +66,7 @@ static void cshutdn_run_conn_handler(struct Curl_easy *data,
                    conn->connection_id, conn->bits.aborted));
       /* There are protocol handlers that block on retrieving
        * server responses here (FTP). Set a short timeout. */
-      conn->handler->disconnect(data, conn, conn->bits.aborted);
+      conn->scheme->run->disconnect(data, conn, (bool)conn->bits.aborted);
     }
 
     conn->bits.shutdown_handler = TRUE;
@@ -85,6 +83,10 @@ static void cshutdn_run_once(struct Curl_easy *data,
   /* We expect to be attached when called */
   DEBUGASSERT(data->conn == conn);
 
+  if(!Curl_shutdown_started(conn, FIRSTSOCKET)) {
+    Curl_shutdown_start(data, FIRSTSOCKET, 0);
+  }
+
   cshutdn_run_conn_handler(data, conn);
 
   if(conn->bits.shutdown_filters) {
@@ -92,14 +94,14 @@ static void cshutdn_run_once(struct Curl_easy *data,
     return;
   }
 
-  if(!conn->connect_only && Curl_conn_is_connected(conn, FIRSTSOCKET))
+  if(!conn->bits.connect_only && Curl_conn_is_connected(conn, FIRSTSOCKET))
     r1 = Curl_conn_shutdown(data, FIRSTSOCKET, &done1);
   else {
     r1 = CURLE_OK;
     done1 = TRUE;
   }
 
-  if(!conn->connect_only && Curl_conn_is_connected(conn, SECONDARYSOCKET))
+  if(!conn->bits.connect_only && Curl_conn_is_connected(conn, SECONDARYSOCKET))
     r2 = Curl_conn_shutdown(data, SECONDARYSOCKET, &done2);
   else {
     r2 = CURLE_OK;
@@ -112,23 +114,22 @@ static void cshutdn_run_once(struct Curl_easy *data,
     conn->bits.shutdown_filters = TRUE;
 }
 
-void Curl_cshutdn_run_once(struct Curl_easy *data,
+void Curl_conn_shutdown_once(struct Curl_easy *admin,
                            struct connectdata *conn,
                            bool *done)
 {
-  DEBUGASSERT(!data->conn);
-  Curl_attach_connection(data, conn);
-  cshutdn_run_once(data, conn, done);
-  CURL_TRC_M(data, "[SHUTDOWN] shutdown, done=%d", *done);
-  Curl_detach_connection(data);
+  DEBUGASSERT(!admin->conn);
+  DEBUGASSERT(!admin->mid);
+  Curl_attach_connection(admin, conn, FALSE);
+  cshutdn_run_once(admin, conn, done);
+  CURL_TRC_M(admin, "[SHUTDOWN] shutdown, done=%d", *done);
+  Curl_detach_connection(admin);
 }
 
-
-void Curl_cshutdn_terminate(struct Curl_easy *data,
-                            struct connectdata *conn,
-                            bool do_shutdown)
+void Curl_conn_terminate(struct Curl_easy *admin,
+                         struct connectdata *conn,
+                         bool do_shutdown)
 {
-  struct Curl_easy *admin = data;
   bool done;
 
   /* there must be a connection to close */
@@ -136,16 +137,10 @@ void Curl_cshutdn_terminate(struct Curl_easy *data,
   /* it must be removed from the connection pool */
   DEBUGASSERT(!conn->bits.in_cpool);
   /* the transfer must be detached from the connection */
-  DEBUGASSERT(data && !data->conn);
+  DEBUGASSERT(admin && !admin->conn);
+  DEBUGASSERT(!admin->mid);
 
-  /* If we can obtain an internal admin handle, use that to attach
-   * and terminate the connection. Some protocol will try to mess with
-   * `data` during shutdown and we do not want that with a `data` from
-   * the application. */
-  if(data->multi && data->multi->admin)
-    admin = data->multi->admin;
-
-  Curl_attach_connection(admin, conn);
+  Curl_attach_connection(admin, conn, FALSE);
 
   cshutdn_run_conn_handler(admin, conn);
   if(do_shutdown) {
@@ -156,22 +151,21 @@ void Curl_cshutdn_terminate(struct Curl_easy *data,
   CURL_TRC_M(admin, "[SHUTDOWN] %sclosing connection #%" FMT_OFF_T,
              conn->bits.shutdown_filters ? "" : "force ",
              conn->connection_id);
-  Curl_conn_close(admin, SECONDARYSOCKET);
-  Curl_conn_close(admin, FIRSTSOCKET);
+  Curl_conn_cf_discard_all(admin, conn, SECONDARYSOCKET);
+  Curl_conn_cf_discard_all(admin, conn, FIRSTSOCKET);
   Curl_detach_connection(admin);
 
-  if(data->multi)
-    Curl_multi_ev_conn_done(data->multi, data, conn);
+  if(admin->multi)
+    Curl_multi_ev_conn_done(admin->multi, admin, conn);
   Curl_conn_free(admin, conn);
 
-  if(data->multi) {
-    CURL_TRC_M(data, "[SHUTDOWN] trigger multi connchanged");
-    Curl_multi_connchanged(data->multi);
+  if(admin->multi) {
+    CURL_TRC_M(admin, "[SHUTDOWN] trigger multi connchanged");
+    Curl_multi_connchanged(admin->multi);
   }
 }
 
 static bool cshutdn_destroy_oldest(struct cshutdn *cshutdn,
-                                   struct Curl_easy *data,
                                    const char *destination)
 {
   struct Curl_llist_node *e;
@@ -186,24 +180,23 @@ static bool cshutdn_destroy_oldest(struct cshutdn *cshutdn,
   }
 
   if(e) {
-    SIGPIPE_VARIABLE(pipe_st);
+    struct Curl_sigpipe_ctx sigpipe_ctx;
     conn = Curl_node_elem(e);
     Curl_node_remove(e);
-    sigpipe_init(&pipe_st);
-    sigpipe_apply(data, &pipe_st);
-    Curl_cshutdn_terminate(data, conn, FALSE);
-    sigpipe_restore(&pipe_st);
+    sigpipe_init(&sigpipe_ctx);
+    sigpipe_apply(cshutdn->multi->admin, &sigpipe_ctx);
+    Curl_conn_terminate(cshutdn->multi->admin, conn, FALSE);
+    sigpipe_restore(&sigpipe_ctx);
     return TRUE;
   }
   return FALSE;
 }
 
-bool Curl_cshutdn_close_oldest(struct Curl_easy *data,
+bool Curl_cshutdn_close_oldest(struct cshutdn *cshutdn,
                                const char *destination)
 {
-  if(data && data->multi) {
-    struct cshutdn *csd = &data->multi->cshutdn;
-    return cshutdn_destroy_oldest(csd, data, destination);
+  if(cshutdn) {
+    return cshutdn_destroy_oldest(cshutdn, destination);
   }
   return FALSE;
 }
@@ -211,7 +204,6 @@ bool Curl_cshutdn_close_oldest(struct Curl_easy *data,
 #define NUM_POLLS_ON_STACK 10
 
 static CURLcode cshutdn_wait(struct cshutdn *cshutdn,
-                             struct Curl_easy *data,
                              int timeout_ms)
 {
   struct pollfd a_few_on_stack[NUM_POLLS_ON_STACK];
@@ -220,7 +212,7 @@ static CURLcode cshutdn_wait(struct cshutdn *cshutdn,
 
   Curl_pollfds_init(&cpfds, a_few_on_stack, NUM_POLLS_ON_STACK);
 
-  result = Curl_cshutdn_add_pollfds(cshutdn, data, &cpfds);
+  result = Curl_cshutdn_add_pollfds(cshutdn, &cpfds);
   if(result)
     goto out;
 
@@ -231,87 +223,77 @@ out:
   return result;
 }
 
-
 static void cshutdn_perform(struct cshutdn *cshutdn,
-                            struct Curl_easy *data)
+                            struct Curl_sigpipe_ctx *sigpipe_ctx)
 {
   struct Curl_llist_node *e = Curl_llist_head(&cshutdn->list);
   struct Curl_llist_node *enext;
+  struct Curl_easy *admin = cshutdn->multi->admin;
   struct connectdata *conn;
-  struct curltime *nowp = NULL;
-  struct curltime now;
   timediff_t next_expire_ms = 0, ms;
   bool done;
 
   if(!e)
     return;
 
-  CURL_TRC_M(data, "[SHUTDOWN] perform on %zu connections",
+  CURL_TRC_M(admin, "[SHUTDOWN] perform on %zu connections",
              Curl_llist_count(&cshutdn->list));
+  sigpipe_apply(admin, sigpipe_ctx);
   while(e) {
     enext = Curl_node_next(e);
     conn = Curl_node_elem(e);
-    Curl_cshutdn_run_once(data, conn, &done);
+    Curl_conn_shutdown_once(admin, conn, &done);
     if(done) {
       Curl_node_remove(e);
-      Curl_cshutdn_terminate(data, conn, FALSE);
+      Curl_conn_terminate(admin, conn, FALSE);
     }
     else {
       /* idata has one timer list, but maybe more than one connection.
        * Set EXPIRE_SHUTDOWN to the smallest time left for all. */
-      if(!nowp) {
-        now = curlx_now();
-        nowp = &now;
-      }
-      ms = Curl_conn_shutdown_timeleft(conn, nowp);
-      if(ms && ms < next_expire_ms)
+      ms = Curl_conn_shutdown_timeleft(admin, conn);
+      if(ms && (!next_expire_ms || (ms < next_expire_ms)))
         next_expire_ms = ms;
     }
     e = enext;
   }
 
   if(next_expire_ms)
-    Curl_expire_ex(data, nowp, next_expire_ms, EXPIRE_SHUTDOWN);
+    Curl_expire(admin, next_expire_ms, EXPIRE_SHUTDOWN);
 }
 
-
 static void cshutdn_terminate_all(struct cshutdn *cshutdn,
-                                  struct Curl_easy *data,
                                   int timeout_ms)
 {
-  struct curltime started = curlx_now();
+  struct Curl_easy *admin = cshutdn->multi->admin;
+  struct curltime started = *Curl_pgrs_now(admin);
   struct Curl_llist_node *e;
-  SIGPIPE_VARIABLE(pipe_st);
+  struct Curl_sigpipe_ctx sigpipe_ctx;
 
-  DEBUGASSERT(cshutdn);
-  DEBUGASSERT(data);
-
-  CURL_TRC_M(data, "[SHUTDOWN] shutdown all");
-  sigpipe_init(&pipe_st);
-  sigpipe_apply(data, &pipe_st);
+  CURL_TRC_M(admin, "[SHUTDOWN] shutdown all");
+  sigpipe_init(&sigpipe_ctx);
 
   while(Curl_llist_head(&cshutdn->list)) {
-    timediff_t timespent;
+    timediff_t spent_ms;
     int remain_ms;
 
-    cshutdn_perform(cshutdn, data);
+    cshutdn_perform(cshutdn, &sigpipe_ctx);
 
     if(!Curl_llist_head(&cshutdn->list)) {
-      CURL_TRC_M(data, "[SHUTDOWN] shutdown finished cleanly");
+      CURL_TRC_M(admin, "[SHUTDOWN] shutdown finished cleanly");
       break;
     }
 
     /* wait for activity, timeout or "nothing" */
-    timespent = curlx_timediff(curlx_now(), started);
-    if(timespent >= (timediff_t)timeout_ms) {
-      CURL_TRC_M(data, "[SHUTDOWN] shutdown finished, %s",
-                (timeout_ms > 0) ? "timeout" : "best effort done");
+    spent_ms = curlx_ptimediff_ms(Curl_pgrs_now(admin), &started);
+    if(spent_ms >= (timediff_t)timeout_ms) {
+      CURL_TRC_M(admin, "[SHUTDOWN] shutdown finished, %s",
+                 (timeout_ms > 0) ? "timeout" : "best effort done");
       break;
     }
 
-    remain_ms = timeout_ms - (int)timespent;
-    if(cshutdn_wait(cshutdn, data, remain_ms)) {
-      CURL_TRC_M(data, "[SHUTDOWN] shutdown finished, aborted");
+    remain_ms = timeout_ms - (int)spent_ms;
+    if(cshutdn_wait(cshutdn, remain_ms)) {
+      CURL_TRC_M(admin, "[SHUTDOWN] shutdown finished, aborted");
       break;
     }
   }
@@ -321,14 +303,13 @@ static void cshutdn_terminate_all(struct cshutdn *cshutdn,
   while(e) {
     struct connectdata *conn = Curl_node_elem(e);
     Curl_node_remove(e);
-    Curl_cshutdn_terminate(data, conn, FALSE);
+    Curl_conn_terminate(admin, conn, FALSE);
     e = Curl_llist_head(&cshutdn->list);
   }
   DEBUGASSERT(!Curl_llist_count(&cshutdn->list));
 
-  sigpipe_restore(&pipe_st);
+  sigpipe_restore(&sigpipe_ctx);
 }
-
 
 int Curl_cshutdn_init(struct cshutdn *cshutdn,
                       struct Curl_multi *multi)
@@ -336,18 +317,18 @@ int Curl_cshutdn_init(struct cshutdn *cshutdn,
   DEBUGASSERT(multi);
   cshutdn->multi = multi;
   Curl_llist_init(&cshutdn->list, NULL);
-  cshutdn->initialised = TRUE;
+  cshutdn->initialized = TRUE;
   return 0; /* good */
 }
 
-
 void Curl_cshutdn_destroy(struct cshutdn *cshutdn,
-                          struct Curl_easy *data)
+                          struct Curl_easy *admin)
 {
-  if(cshutdn->initialised && data) {
+  if(cshutdn->initialized && admin) {
     int timeout_ms = 0;
-    /* Just for testing, run graceful shutdown */
+    /* for testing, run graceful shutdown */
 #ifdef DEBUGBUILD
+    DEBUGASSERT(!admin->mid);
     {
       const char *p = getenv("CURL_GRACEFUL_SHUTDOWN");
       if(p) {
@@ -358,29 +339,28 @@ void Curl_cshutdn_destroy(struct cshutdn *cshutdn,
     }
 #endif
 
-    CURL_TRC_M(data, "[SHUTDOWN] destroy, %zu connections, timeout=%dms",
+    CURL_TRC_M(admin, "[SHUTDOWN] destroy, %zu connections, timeout=%dms",
                Curl_llist_count(&cshutdn->list), timeout_ms);
-    cshutdn_terminate_all(cshutdn, data, timeout_ms);
+    cshutdn_terminate_all(cshutdn, timeout_ms);
   }
   cshutdn->multi = NULL;
+  cshutdn->initialized = FALSE;
 }
 
-size_t Curl_cshutdn_count(struct Curl_easy *data)
+size_t Curl_cshutdn_count(struct cshutdn *cshutdn)
 {
-  if(data && data->multi) {
-    struct cshutdn *csd = &data->multi->cshutdn;
-    return Curl_llist_count(&csd->list);
+  if(cshutdn) {
+    return Curl_llist_count(&cshutdn->list);
   }
   return 0;
 }
 
-size_t Curl_cshutdn_dest_count(struct Curl_easy *data,
+size_t Curl_cshutdn_dest_count(struct cshutdn *cshutdn,
                                const char *destination)
 {
-  if(data && data->multi) {
-    struct cshutdn *csd = &data->multi->cshutdn;
+  if(cshutdn) {
     size_t n = 0;
-    struct Curl_llist_node *e = Curl_llist_head(&csd->list);
+    struct Curl_llist_node *e = Curl_llist_head(&cshutdn->list);
     while(e) {
       struct connectdata *conn = Curl_node_elem(e);
       if(!strcmp(destination, conn->destination))
@@ -392,131 +372,93 @@ size_t Curl_cshutdn_dest_count(struct Curl_easy *data,
   return 0;
 }
 
-
 static CURLMcode cshutdn_update_ev(struct cshutdn *cshutdn,
-                                   struct Curl_easy *data,
                                    struct connectdata *conn)
 {
+  struct Curl_easy *admin = cshutdn->multi->admin;
   CURLMcode mresult;
 
   DEBUGASSERT(cshutdn);
   DEBUGASSERT(cshutdn->multi->socket_cb);
 
-  Curl_attach_connection(data, conn);
-  mresult = Curl_multi_ev_assess_conn(cshutdn->multi, data, conn);
-  Curl_detach_connection(data);
+  Curl_attach_connection(admin, conn, FALSE);
+  mresult = Curl_multi_ev_assess_conn(cshutdn->multi, admin, conn);
+  Curl_detach_connection(admin);
   return mresult;
 }
-
 
 void Curl_cshutdn_add(struct cshutdn *cshutdn,
                       struct connectdata *conn,
                       size_t conns_in_pool)
 {
-  struct Curl_easy *data = cshutdn->multi->admin;
-  size_t max_total = (cshutdn->multi->max_total_connections > 0) ?
-                     (size_t)cshutdn->multi->max_total_connections : 0;
+  struct Curl_easy *admin = cshutdn->multi->admin;
+  size_t max_total = cshutdn->multi->max_total_connections;
 
   /* Add the connection to our shutdown list for non-blocking shutdown
    * during multi processing. */
-  if(max_total > 0 && (max_total <=
-        (conns_in_pool + Curl_llist_count(&cshutdn->list)))) {
-    CURL_TRC_M(data, "[SHUTDOWN] discarding oldest shutdown connection "
+  if(max_total > 0 &&
+     (max_total <= (conns_in_pool + Curl_llist_count(&cshutdn->list)))) {
+    CURL_TRC_M(admin, "[SHUTDOWN] discarding oldest shutdown connection "
                "due to connection limit of %zu", max_total);
-    cshutdn_destroy_oldest(cshutdn, data, NULL);
+    cshutdn_destroy_oldest(cshutdn, NULL);
   }
 
   if(cshutdn->multi->socket_cb) {
-    if(cshutdn_update_ev(cshutdn, data, conn)) {
-      CURL_TRC_M(data, "[SHUTDOWN] update events failed, discarding #%"
+    if(cshutdn_update_ev(cshutdn, conn)) {
+      CURL_TRC_M(admin, "[SHUTDOWN] update events failed, discarding #%"
                  FMT_OFF_T, conn->connection_id);
-      Curl_cshutdn_terminate(data, conn, FALSE);
+      Curl_conn_terminate(admin, conn, FALSE);
       return;
     }
   }
 
   Curl_llist_append(&cshutdn->list, conn, &conn->cshutdn_node);
-  CURL_TRC_M(data, "[SHUTDOWN] added #%" FMT_OFF_T
+  CURL_TRC_M(admin, "[SHUTDOWN] added #%" FMT_OFF_T
              " to shutdowns, now %zu conns in shutdown",
              conn->connection_id, Curl_llist_count(&cshutdn->list));
 }
 
-
-static void cshutdn_multi_socket(struct cshutdn *cshutdn,
-                                 struct Curl_easy *data,
-                                 curl_socket_t s)
-{
-  struct Curl_llist_node *e;
-  struct connectdata *conn;
-  bool done;
-
-  DEBUGASSERT(cshutdn->multi->socket_cb);
-  e = Curl_llist_head(&cshutdn->list);
-  while(e) {
-    conn = Curl_node_elem(e);
-    if(s == conn->sock[FIRSTSOCKET] || s == conn->sock[SECONDARYSOCKET]) {
-      Curl_cshutdn_run_once(data, conn, &done);
-      if(done || cshutdn_update_ev(cshutdn, data, conn)) {
-        Curl_node_remove(e);
-        Curl_cshutdn_terminate(data, conn, FALSE);
-      }
-      break;
-    }
-    e = Curl_node_next(e);
-  }
-}
-
-
 void Curl_cshutdn_perform(struct cshutdn *cshutdn,
-                          struct Curl_easy *data,
-                          curl_socket_t s)
+                          struct Curl_sigpipe_ctx *sigpipe_ctx)
 {
-  if((s == CURL_SOCKET_TIMEOUT) || (!cshutdn->multi->socket_cb))
-    cshutdn_perform(cshutdn, data);
-  else
-    cshutdn_multi_socket(cshutdn, data, s);
+  cshutdn_perform(cshutdn, sigpipe_ctx);
 }
 
 /* return fd_set info about the shutdown connections */
 void Curl_cshutdn_setfds(struct cshutdn *cshutdn,
-                         struct Curl_easy *data,
                          fd_set *read_fd_set, fd_set *write_fd_set,
                          int *maxfd)
 {
   if(Curl_llist_head(&cshutdn->list)) {
+    struct Curl_easy *admin = cshutdn->multi->admin;
     struct Curl_llist_node *e;
     struct easy_pollset ps;
 
     Curl_pollset_init(&ps);
-    for(e = Curl_llist_head(&cshutdn->list); e;
-        e = Curl_node_next(e)) {
+    for(e = Curl_llist_head(&cshutdn->list); e; e = Curl_node_next(e)) {
       unsigned int i;
       struct connectdata *conn = Curl_node_elem(e);
       CURLcode result;
 
       Curl_pollset_reset(&ps);
-      Curl_attach_connection(data, conn);
-      result = Curl_conn_adjust_pollset(data, conn, &ps);
-      Curl_detach_connection(data);
+      Curl_attach_connection(admin, conn, FALSE);
+      result = Curl_conn_adjust_pollset(admin, conn, &ps);
+      Curl_detach_connection(admin);
 
       if(result)
         continue;
 
       for(i = 0; i < ps.n; i++) {
-#ifdef __DJGPP__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Warith-conversion"
-#endif
+        curl_socket_t sock = ps.sockets[i];
+        if(!FDSET_SOCK(sock))
+          continue;
         if(ps.actions[i] & CURL_POLL_IN)
-          FD_SET(ps.sockets[i], read_fd_set);
+          FD_SET(sock, read_fd_set);
         if(ps.actions[i] & CURL_POLL_OUT)
-          FD_SET(ps.sockets[i], write_fd_set);
-#ifdef __DJGPP__
-#pragma GCC diagnostic pop
-#endif
+          FD_SET(sock, write_fd_set);
         if((ps.actions[i] & (CURL_POLL_OUT | CURL_POLL_IN)) &&
-           ((int)ps.sockets[i] > *maxfd))
-          *maxfd = (int)ps.sockets[i];
+           ((int)sock > *maxfd))
+          *maxfd = (int)sock;
       }
     }
     Curl_pollset_cleanup(&ps);
@@ -525,25 +467,24 @@ void Curl_cshutdn_setfds(struct cshutdn *cshutdn,
 
 /* return information about the shutdown connections */
 unsigned int Curl_cshutdn_add_waitfds(struct cshutdn *cshutdn,
-                                      struct Curl_easy *data,
                                       struct Curl_waitfds *cwfds)
 {
   unsigned int need = 0;
 
   if(Curl_llist_head(&cshutdn->list)) {
     struct Curl_llist_node *e;
+    struct Curl_easy *admin = cshutdn->multi->admin;
     struct easy_pollset ps;
     struct connectdata *conn;
     CURLcode result;
 
     Curl_pollset_init(&ps);
-    for(e = Curl_llist_head(&cshutdn->list); e;
-        e = Curl_node_next(e)) {
+    for(e = Curl_llist_head(&cshutdn->list); e; e = Curl_node_next(e)) {
       conn = Curl_node_elem(e);
       Curl_pollset_reset(&ps);
-      Curl_attach_connection(data, conn);
-      result = Curl_conn_adjust_pollset(data, conn, &ps);
-      Curl_detach_connection(data);
+      Curl_attach_connection(admin, conn, FALSE);
+      result = Curl_conn_adjust_pollset(admin, conn, &ps);
+      Curl_detach_connection(admin);
 
       if(!result)
         need += Curl_waitfds_add_ps(cwfds, &ps);
@@ -554,7 +495,6 @@ unsigned int Curl_cshutdn_add_waitfds(struct cshutdn *cshutdn,
 }
 
 CURLcode Curl_cshutdn_add_pollfds(struct cshutdn *cshutdn,
-                                  struct Curl_easy *data,
                                   struct curl_pollfds *cpfds)
 {
   CURLcode result = CURLE_OK;
@@ -562,16 +502,16 @@ CURLcode Curl_cshutdn_add_pollfds(struct cshutdn *cshutdn,
   if(Curl_llist_head(&cshutdn->list)) {
     struct Curl_llist_node *e;
     struct easy_pollset ps;
+    struct Curl_easy *admin = cshutdn->multi->admin;
     struct connectdata *conn;
 
     Curl_pollset_init(&ps);
-    for(e = Curl_llist_head(&cshutdn->list); e;
-        e = Curl_node_next(e)) {
+    for(e = Curl_llist_head(&cshutdn->list); e; e = Curl_node_next(e)) {
       conn = Curl_node_elem(e);
       Curl_pollset_reset(&ps);
-      Curl_attach_connection(data, conn);
-      result = Curl_conn_adjust_pollset(data, conn, &ps);
-      Curl_detach_connection(data);
+      Curl_attach_connection(admin, conn, FALSE);
+      result = Curl_conn_adjust_pollset(admin, conn, &ps);
+      Curl_detach_connection(admin);
 
       if(!result)
         result = Curl_pollfds_add_ps(cpfds, &ps);

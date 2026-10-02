@@ -23,17 +23,25 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-
 #ifndef CURL_DISABLE_RTSP
-
-extern const struct Curl_handler Curl_handler_rtsp;
-
 CURLcode Curl_rtsp_parseheader(struct Curl_easy *data, const char *header);
-
+extern const struct Curl_protocol Curl_protocol_rtsp;
 #else
-/* disabled */
-#define Curl_rtsp_parseheader(x,y) CURLE_NOT_BUILT_IN
+#define Curl_rtsp_parseheader(x, y) CURLE_NOT_BUILT_IN
+#endif
 
-#endif /* CURL_DISABLE_RTSP */
+#define RTSPREQ_NONE CURL_RTSPREQ_NONE
+#define RTSPREQ_OPTIONS CURL_RTSPREQ_OPTIONS
+#define RTSPREQ_DESCRIBE CURL_RTSPREQ_DESCRIBE
+#define RTSPREQ_ANNOUNCE CURL_RTSPREQ_ANNOUNCE
+#define RTSPREQ_SETUP CURL_RTSPREQ_SETUP
+#define RTSPREQ_PLAY CURL_RTSPREQ_PLAY
+#define RTSPREQ_PAUSE CURL_RTSPREQ_PAUSE
+#define RTSPREQ_TEARDOWN CURL_RTSPREQ_TEARDOWN
+#define RTSPREQ_GET_PARAMETER CURL_RTSPREQ_GET_PARAMETER
+#define RTSPREQ_SET_PARAMETER CURL_RTSPREQ_SET_PARAMETER
+#define RTSPREQ_RECORD CURL_RTSPREQ_RECORD
+#define RTSPREQ_RECEIVE CURL_RTSPREQ_RECEIVE
+#define RTSPREQ_LAST CURL_RTSPREQ_LAST
 
 #endif /* HEADER_CURL_RTSP_H */

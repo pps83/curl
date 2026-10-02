@@ -23,22 +23,13 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-
-#include "../curl_setup.h"
-#include <curl/curl.h>
+#include "curl_setup.h"
 
 #ifdef USE_GNUTLS
 
 #include <gnutls/gnutls.h>
-#include "../curlx/timeval.h"
 
-#ifdef HAVE_GNUTLS_SRP
-/* the function exists */
-#ifdef USE_TLS_SRP
-/* the functionality is not disabled */
-#define USE_GNUTLS_SRP
-#endif
-#endif
+#include "curlx/timeval.h"
 
 struct Curl_easy;
 struct Curl_cfilter;
@@ -48,8 +39,6 @@ struct ssl_config_data;
 struct ssl_peer;
 struct ssl_connect_data;
 struct Curl_ssl_session;
-
-int Curl_glts_get_ietf_proto(gnutls_session_t session);
 
 struct gtls_shared_creds {
   gnutls_certificate_credentials_t creds;
@@ -67,9 +56,6 @@ void Curl_gtls_shared_creds_free(struct gtls_shared_creds **pcreds);
 struct gtls_ctx {
   gnutls_session_t session;
   struct gtls_shared_creds *shared_creds;
-#ifdef USE_GNUTLS_SRP
-  gnutls_srp_client_credentials_t srp_client_cred;
-#endif
   CURLcode io_result; /* result of last IO cfilter operation */
   BIT(sent_shutdown);
 };
@@ -90,7 +76,7 @@ CURLcode Curl_gtls_ctx_init(struct gtls_ctx *gctx,
                             struct Curl_cfilter *cf,
                             struct Curl_easy *data,
                             struct ssl_peer *peer,
-                            const struct alpn_spec *alpns,
+                            const struct alpn_spec *alpns_requested,
                             Curl_gtls_ctx_setup_cb *cb_setup,
                             void *cb_user_data,
                             void *ssl_user_data,
@@ -108,7 +94,8 @@ CURLcode Curl_gtls_verifyserver(struct Curl_cfilter *cf,
                                 struct ssl_peer *peer,
                                 const char *pinned_key);
 
-/* Extract TLS session and place in cache, if configured. */
+/* Extract TLS session and place in cache, if configured. Return
+ * a copy of the session if desired. */
 CURLcode Curl_gtls_cache_session(struct Curl_cfilter *cf,
                                  struct Curl_easy *data,
                                  const char *ssl_peer_key,
@@ -116,11 +103,11 @@ CURLcode Curl_gtls_cache_session(struct Curl_cfilter *cf,
                                  curl_off_t valid_until,
                                  const char *alpn,
                                  unsigned char *quic_tp,
-                                 size_t quic_tp_len);
+                                 size_t quic_tp_len,
+                                 struct Curl_ssl_session **psession);
 
 /* Report properties of a successful handshake */
-void Curl_gtls_report_handshake(struct Curl_easy *data,
-                                struct gtls_ctx *gctx);
+void Curl_gtls_report_handshake(struct Curl_easy *data, struct gtls_ctx *gctx);
 
 extern const struct Curl_ssl Curl_ssl_gnutls;
 

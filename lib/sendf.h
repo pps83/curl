@@ -23,10 +23,8 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-
 #include "curl_setup.h"
-
-#include "curl_trc.h"
+#include "cw-out.h"
 
 /**
  * Type of data that is being written to the client (application)
@@ -42,22 +40,29 @@
  * BODY, INFO and HEADER should not be mixed, as this would lead to
  * confusion on how to interpret/format/convert the data.
  */
-#define CLIENTWRITE_BODY    (1<<0) /* non-meta information, BODY */
-#define CLIENTWRITE_INFO    (1<<1) /* meta information, not a HEADER */
-#define CLIENTWRITE_HEADER  (1<<2) /* meta information, HEADER */
-#define CLIENTWRITE_STATUS  (1<<3) /* a special status HEADER */
-#define CLIENTWRITE_CONNECT (1<<4) /* a CONNECT related HEADER */
-#define CLIENTWRITE_1XX     (1<<5) /* a 1xx response related HEADER */
-#define CLIENTWRITE_TRAILER (1<<6) /* a trailer HEADER */
-#define CLIENTWRITE_EOS     (1<<7) /* End Of transfer download Stream */
-#define CLIENTWRITE_0LEN    (1<<8) /* write even 0-length buffers */
+#define CLIENTWRITE_BODY    (1 << 0) /* non-meta information, BODY */
+#define CLIENTWRITE_INFO    (1 << 1) /* meta information, not a HEADER */
+#define CLIENTWRITE_HEADER  (1 << 2) /* meta information, HEADER */
+#define CLIENTWRITE_STATUS  (1 << 3) /* a special status HEADER */
+#define CLIENTWRITE_CONNECT (1 << 4) /* a CONNECT related HEADER */
+#define CLIENTWRITE_1XX     (1 << 5) /* a 1xx response related HEADER */
+#define CLIENTWRITE_TRAILER (1 << 6) /* a trailer HEADER */
+#define CLIENTWRITE_EOS     (1 << 7) /* End Of transfer download Stream */
+#define CLIENTWRITE_0LEN    (1 << 8) /* write even 0-length buffers */
+
+/* Forward declarations */
+struct Curl_creader;
+struct Curl_cwriter;
+struct Curl_easy;
 
 /**
- * Write `len` bytes at `prt` to the client. `type` indicates what
+ * Write `len` bytes at `buf` to the client. `type` indicates what
  * kind of data is being written.
  */
-CURLcode Curl_client_write(struct Curl_easy *data, int type, const char *ptr,
+CURLcode Curl_client_write(struct Curl_easy *data, int type, const char *buf,
                            size_t len) WARN_UNUSED_RESULT;
+
+CURLcode Curl_client_flush(struct Curl_easy *data);
 
 /**
  * Free all resources related to client writing.
@@ -100,19 +105,26 @@ typedef enum {
   CURL_CW_RAW,  /* raw data written, before any decoding */
   CURL_CW_TRANSFER_DECODE, /* remove transfer-encodings */
   CURL_CW_PROTOCOL, /* after transfer, but before content decoding */
+  CURL_CW_BEFORE_DECODE, /* after protocol, but before content decoding */
   CURL_CW_CONTENT_DECODE, /* remove content-encodings */
   CURL_CW_CLIENT  /* data written to client */
 } Curl_cwriter_phase;
+
+/* writer may blow up size of write data, e.g. zip bombs */
+#define CURL_CW_FLAG_BLOWUP     (1U << 0)
 
 /* Client Writer Type, provides the implementation */
 struct Curl_cwtype {
   const char *name;        /* writer name. */
   const char *alias;       /* writer name alias, maybe NULL. */
+  uint8_t flags;           /* flags for writer behaviour */
   CURLcode (*do_init)(struct Curl_easy *data,
                       struct Curl_cwriter *writer);
   CURLcode (*do_write)(struct Curl_easy *data,
                        struct Curl_cwriter *writer, int type,
                        const char *buf, size_t nbytes);
+  CURLcode (*do_flush)(struct Curl_easy *data,
+                       struct Curl_cwriter *writer);
   void (*do_close)(struct Curl_easy *data,
                    struct Curl_cwriter *writer);
   size_t cwriter_size;  /* sizeof() allocated struct Curl_cwriter */
@@ -138,7 +150,7 @@ struct Curl_cwriter {
  */
 CURLcode Curl_cwriter_create(struct Curl_cwriter **pwriter,
                              struct Curl_easy *data,
-                             const struct Curl_cwtype *ce_handler,
+                             const struct Curl_cwtype *cwt,
                              Curl_cwriter_phase phase);
 
 /**
@@ -170,20 +182,16 @@ struct Curl_cwriter *Curl_cwriter_get_by_type(struct Curl_easy *data,
 struct Curl_cwriter *Curl_cwriter_get_by_name(struct Curl_easy *data,
                                               const char *name);
 
-/**
- * Convenience method for calling `writer->do_write()` that
- * checks for NULL writer.
- */
-CURLcode Curl_cwriter_write(struct Curl_easy *data,
-                            struct Curl_cwriter *writer, int type,
-                            const char *buf, size_t nbytes);
+/* Convenience method for calling `writer->do_write()` that
+ * checks for NULL writer. */
+#define Curl_cwriter_write(d, w, t, b, n) \
+  ((w) ? (w)->cwt->do_write((d), (w), (t), (b), (n)) : CURLE_WRITE_ERROR)
 
-/**
- * Return TRUE iff client writer is paused.
- */
-bool Curl_cwriter_is_paused(struct Curl_easy *data);
+#define Curl_cwriter_flush(d, w) \
+  ((w) ? (w)->cwt->do_flush((d), (w)) : CURLE_WRITE_ERROR)
 
-bool Curl_cwriter_is_content_decoding(struct Curl_easy *data);
+/* TRUE if client writer is paused. */
+#define Curl_cwriter_is_paused(d)     ((bool)(d)->req.writer.paused)
 
 /**
  * Unpause client writer and flush any buffered date to the client.
@@ -199,9 +207,10 @@ CURLcode Curl_cwriter_def_init(struct Curl_easy *data,
 CURLcode Curl_cwriter_def_write(struct Curl_easy *data,
                                 struct Curl_cwriter *writer, int type,
                                 const char *buf, size_t nbytes);
+CURLcode Curl_cwriter_def_flush(struct Curl_easy *data,
+                                struct Curl_cwriter *writer);
 void Curl_cwriter_def_close(struct Curl_easy *data,
                             struct Curl_cwriter *writer);
-
 
 typedef enum {
   CURL_CRCNTRL_REWIND,
@@ -297,7 +306,7 @@ void Curl_creader_clear_eos(struct Curl_easy *data,
  */
 CURLcode Curl_creader_create(struct Curl_creader **preader,
                              struct Curl_easy *data,
-                             const struct Curl_crtype *cr_handler,
+                             const struct Curl_crtype *crt,
                              Curl_creader_phase phase);
 
 /**
@@ -376,7 +385,7 @@ curl_off_t Curl_creader_client_length(struct Curl_easy *data);
  *                values will be ignored.
  * @return CURLE_OK if offset could be set
  *         CURLE_READ_ERROR if not supported by reader or seek/read failed
- *                          of offset larger then total length
+ *                          of offset larger than total length
  *         CURLE_PARTIAL_FILE if offset led to 0 total length
  */
 CURLcode Curl_creader_resume_from(struct Curl_easy *data, curl_off_t offset);
@@ -402,7 +411,6 @@ void Curl_creader_done(struct Curl_easy *data, int premature);
  */
 struct Curl_creader *Curl_creader_get_by_type(struct Curl_easy *data,
                                               const struct Curl_crtype *crt);
-
 
 /**
  * Set the client reader to provide 0 bytes, immediate EOS.

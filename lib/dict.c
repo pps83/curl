@@ -21,8 +21,9 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
-
 #include "curl_setup.h"
+#include "urldata.h"
+#include "dict.h"
 
 #ifndef CURL_DISABLE_DICT
 
@@ -52,61 +53,18 @@
 #include <unistd.h>
 #endif
 
-#include "urldata.h"
-#include <curl/curl.h>
 #include "transfer.h"
-#include "sendf.h"
+#include "curl_trc.h"
+#include "connect.h"
+#include "select.h"
 #include "escape.h"
-#include "progress.h"
-#include "dict.h"
 
-/* The last 2 #include files should be: */
-#include "curl_memory.h"
-#include "memdebug.h"
-
-
-#define DICT_MATCH "/MATCH:"
-#define DICT_MATCH2 "/M:"
-#define DICT_MATCH3 "/FIND:"
-#define DICT_DEFINE "/DEFINE:"
+#define DICT_MATCH   "/MATCH:"
+#define DICT_MATCH2  "/M:"
+#define DICT_MATCH3  "/FIND:"
+#define DICT_DEFINE  "/DEFINE:"
 #define DICT_DEFINE2 "/D:"
 #define DICT_DEFINE3 "/LOOKUP:"
-
-
-/*
- * Forward declarations.
- */
-
-static CURLcode dict_do(struct Curl_easy *data, bool *done);
-
-/*
- * DICT protocol handler.
- */
-
-const struct Curl_handler Curl_handler_dict = {
-  "dict",                               /* scheme */
-  ZERO_NULL,                            /* setup_connection */
-  dict_do,                              /* do_it */
-  ZERO_NULL,                            /* done */
-  ZERO_NULL,                            /* do_more */
-  ZERO_NULL,                            /* connect_it */
-  ZERO_NULL,                            /* connecting */
-  ZERO_NULL,                            /* doing */
-  ZERO_NULL,                            /* proto_pollset */
-  ZERO_NULL,                            /* doing_pollset */
-  ZERO_NULL,                            /* domore_pollset */
-  ZERO_NULL,                            /* perform_pollset */
-  ZERO_NULL,                            /* disconnect */
-  ZERO_NULL,                            /* write_resp */
-  ZERO_NULL,                            /* write_resp_hd */
-  ZERO_NULL,                            /* connection_check */
-  ZERO_NULL,                            /* attach connection */
-  ZERO_NULL,                            /* follow */
-  PORT_DICT,                            /* defport */
-  CURLPROTO_DICT,                       /* protocol */
-  CURLPROTO_DICT,                       /* family */
-  PROTOPT_NONE | PROTOPT_NOURLQUERY     /* flags */
-};
 
 #define DYN_DICT_WORD 10000
 static char *unescape_word(const char *input)
@@ -137,9 +95,12 @@ static CURLcode sendf(struct Curl_easy *data,
 
 static CURLcode sendf(struct Curl_easy *data, const char *fmt, ...)
 {
+  curl_socket_t sockfd = data->conn->sock[FIRSTSOCKET];
   size_t bytes_written;
   size_t write_len;
   CURLcode result = CURLE_OK;
+  timediff_t timeout_ms;
+  int what;
   char *s;
   char *sptr;
   va_list ap;
@@ -160,9 +121,9 @@ static CURLcode sendf(struct Curl_easy *data, const char *fmt, ...)
     if(result)
       break;
 
-    Curl_debug(data, CURLINFO_DATA_OUT, sptr, (size_t)bytes_written);
+    Curl_debug(data, CURLINFO_DATA_OUT, sptr, bytes_written);
 
-    if((size_t)bytes_written != write_len) {
+    if(bytes_written != write_len) {
       /* if not all was written at once, we must advance the pointer, decrease
          the size left and try again! */
       write_len -= bytes_written;
@@ -170,9 +131,32 @@ static CURLcode sendf(struct Curl_easy *data, const char *fmt, ...)
     }
     else
       break;
+
+    timeout_ms = Curl_timeleft_ms(data);
+    if(timeout_ms < 0) {
+      result = CURLE_OPERATION_TIMEDOUT;
+      break;
+    }
+    if(!timeout_ms)
+      timeout_ms = TIMEDIFF_T_MAX;
+
+    /* Do not busyloop. The entire loop thing is a workaround as it causes a
+       BLOCKING behavior which is a NO-NO. This function should rather be
+       split up in a do and a doing piece where the pieces that are not
+       possible to send now will be sent in the doing function repeatedly
+       until the entire request is sent. */
+    what = SOCKET_WRITABLE(sockfd, timeout_ms);
+    if(what < 0) {
+      result = CURLE_SEND_ERROR;
+      break;
+    }
+    else if(!what) {
+      result = CURLE_OPERATION_TIMEDOUT;
+      break;
+    }
   }
 
-  free(s); /* free the output string */
+  curlx_free(s); /* free the output string */
 
   return result;
 }
@@ -192,14 +176,14 @@ static CURLcode dict_do(struct Curl_easy *data, bool *done)
 
   *done = TRUE; /* unconditionally */
 
-  /* url-decode path before further evaluation */
+  /* URL-decode path before further evaluation */
   result = Curl_urldecode(data->state.up.path, 0, &path, NULL, REJECT_CTRL);
   if(result)
     return result;
 
-  if(curl_strnequal(path, DICT_MATCH, sizeof(DICT_MATCH)-1) ||
-     curl_strnequal(path, DICT_MATCH2, sizeof(DICT_MATCH2)-1) ||
-     curl_strnequal(path, DICT_MATCH3, sizeof(DICT_MATCH3)-1)) {
+  if(curl_strnequal(path, DICT_MATCH, CURL_CSTRLEN(DICT_MATCH)) ||
+     curl_strnequal(path, DICT_MATCH2, CURL_CSTRLEN(DICT_MATCH2)) ||
+     curl_strnequal(path, DICT_MATCH3, CURL_CSTRLEN(DICT_MATCH3))) {
 
     word = strchr(path, ':');
     if(word) {
@@ -244,9 +228,9 @@ static CURLcode dict_do(struct Curl_easy *data, bool *done)
     }
     Curl_xfer_setup_recv(data, FIRSTSOCKET, -1);
   }
-  else if(curl_strnequal(path, DICT_DEFINE, sizeof(DICT_DEFINE)-1) ||
-          curl_strnequal(path, DICT_DEFINE2, sizeof(DICT_DEFINE2)-1) ||
-          curl_strnequal(path, DICT_DEFINE3, sizeof(DICT_DEFINE3)-1)) {
+  else if(curl_strnequal(path, DICT_DEFINE, CURL_CSTRLEN(DICT_DEFINE)) ||
+          curl_strnequal(path, DICT_DEFINE2, CURL_CSTRLEN(DICT_DEFINE2)) ||
+          curl_strnequal(path, DICT_DEFINE3, CURL_CSTRLEN(DICT_DEFINE3))) {
 
     word = strchr(path, ':');
     if(word) {
@@ -310,8 +294,32 @@ static CURLcode dict_do(struct Curl_easy *data, bool *done)
   }
 
 error:
-  free(eword);
-  free(path);
+  curlx_free(eword);
+  curlx_free(path);
   return result;
 }
+
+/*
+ * DICT protocol
+ */
+const struct Curl_protocol Curl_protocol_dict = {
+  ZERO_NULL,                            /* setup_connection */
+  dict_do,                              /* do_it */
+  ZERO_NULL,                            /* done */
+  ZERO_NULL,                            /* do_more */
+  ZERO_NULL,                            /* connect_it */
+  ZERO_NULL,                            /* connecting */
+  ZERO_NULL,                            /* doing */
+  ZERO_NULL,                            /* proto_pollset */
+  ZERO_NULL,                            /* doing_pollset */
+  ZERO_NULL,                            /* domore_pollset */
+  ZERO_NULL,                            /* perform_pollset */
+  ZERO_NULL,                            /* disconnect */
+  ZERO_NULL,                            /* write_resp */
+  ZERO_NULL,                            /* write_resp_hd */
+  ZERO_NULL,                            /* connection_is_dead */
+  ZERO_NULL,                            /* attach connection */
+  ZERO_NULL,                            /* follow */
+};
+
 #endif /* CURL_DISABLE_DICT */
