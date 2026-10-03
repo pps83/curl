@@ -26,6 +26,10 @@
 
 /* Handcrafted config file for building via Visual Studio IDE Project Files */
 
+#if !defined(_MSC_VER) || _MSC_VER > 1800
+#error This manual configuration requires MSVC 2010-2013 (IDE Project builds)
+#endif
+
 /*
  * Headers and functions
  */
@@ -33,7 +37,7 @@
 #define HAVE_FCNTL_H 1
 #define HAVE_IO_H 1
 #define HAVE_LOCALE_H 1
-#if !defined(_MSC_VER) || _MSC_VER >= 1800
+#if _MSC_VER >= 1800
 #define HAVE_STDBOOL_H 1
 #define HAVE_BOOL_T 1
 #endif
@@ -74,14 +78,10 @@
 #define SIZEOF_LONG 4
 #ifdef _WIN64
 #  define SIZEOF_SIZE_T 8
-#  ifndef __MINGW32__
-#    define ssize_t __int64
-#  endif
+#  define ssize_t __int64
 #else
 #  define SIZEOF_SIZE_T 4
-#  ifndef __MINGW32__
-#    define ssize_t int
-#  endif
+#  define ssize_t int
 #endif
 #define SIZEOF_CURL_OFF_T 8
 /* Default to 64-bit time_t unless _USE_32BIT_TIME_T is defined */
@@ -90,11 +90,7 @@
 #else
 #  define SIZEOF_TIME_T 4
 #endif
-#if defined(__MINGW32__) && defined(_FILE_OFFSET_BITS) && (_FILE_OFFSET_BITS == 64)
-#  define SIZEOF_OFF_T 8
-#else
-#  define SIZEOF_OFF_T 4
-#endif
+#define SIZEOF_OFF_T 4
 
 #define HAVE_STRUCT_SOCKADDR_STORAGE 1
 #define HAVE_STRUCT_TIMEVAL 1

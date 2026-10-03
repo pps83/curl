@@ -139,11 +139,7 @@
 
 #include "curl_config.h"
 
-#else /* !HAVE_CONFIG_H */
-
-#ifdef __CYGWIN__
-#  include "config-msys.h"
-#endif
+#else /* HAVE_CONFIG_H */
 
 #ifdef _WIN32
 #  include "config-win32.h"
