@@ -65,6 +65,7 @@ string(REGEX REPLACE "([0-9]+\.[0-9]+\.[0-9]+).+" "\\1" _curl_version_sem "${_cu
 project(CURL
   VERSION "${_curl_version_sem}"
   LANGUAGES C)
+include(MiniDefaults)
 
 # CMake does not recognize some targets accurately. Touch up configuration manually as a workaround.
 if(WINDOWS_STORE AND MINGW)  # MinGW UWP build
