@@ -744,11 +744,14 @@ ${SIZEOF_TIME_T_CODE}
 /* if Unix domain sockets are enabled */
 #cmakedefine USE_UNIX_SOCKETS 1
 
+/* A build that defines USE_OPENSSL gets OpenSSL instead of Schannel */
+#ifndef USE_OPENSSL
 /* to enable SSPI support */
 #cmakedefine USE_WINDOWS_SSPI 1
 
 /* to enable Windows SSL */
 #cmakedefine USE_SCHANNEL 1
+#endif
 
 /* if Watt-32 is in use */
 #cmakedefine USE_WATT32 1

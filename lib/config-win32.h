@@ -752,11 +752,14 @@
 /* if Unix domain sockets are enabled */
 #define USE_UNIX_SOCKETS 1
 
+/* A build that defines USE_OPENSSL gets OpenSSL instead of Schannel */
+#ifndef USE_OPENSSL
 /* to enable SSPI support */
 #define USE_WINDOWS_SSPI 1
 
 /* to enable Windows SSL */
 #define USE_SCHANNEL 1
+#endif
 
 /* if Watt-32 is in use */
 /* #undef USE_WATT32 */
