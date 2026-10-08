@@ -1,7 +1,11 @@
 # Writes lib/config-win32.h: curl's CMake configuration for MSVC, the x64 and Win32 differences under _WIN64.
-# Run from anywhere: cmake -P CMake/GenerateConfigWin32.cmake
+# Run as cmake -D build=<scratch directory> -P CMake/GenerateConfigWin32.cmake; the directory is removed at the end.
 set(root ${CMAKE_CURRENT_LIST_DIR}/..)
-file(TO_CMAKE_PATH "$ENV{TEMP}/curl-config-win32" build)
+if(NOT build)
+  message(FATAL_ERROR "pass the scratch directory: cmake -D build=<directory> -P GenerateConfigWin32.cmake")
+endif()
+file(TO_CMAKE_PATH "${build}" build)
+get_filename_component(build "${build}" ABSOLUTE)
 foreach(arch x64 Win32)
   execute_process(COMMAND ${CMAKE_COMMAND} -S ${root} -B ${build}/${arch} -G "Visual Studio 18 2026" -A ${arch}
                   RESULT_VARIABLE result OUTPUT_QUIET)
