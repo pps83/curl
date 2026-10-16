@@ -148,9 +148,6 @@
 /* disabled shuffle DNS feature */
 #cmakedefine CURL_DISABLE_SHUFFLE_DNS 1
 
-/* disables SMB */
-#cmakedefine CURL_ENABLE_SMB 1
-
 /* disables SMTP */
 #cmakedefine CURL_DISABLE_SMTP 1
 
@@ -205,6 +202,9 @@
 
 /* Define to 1 if you have the `accept4' function. */
 #cmakedefine HAVE_ACCEPT4 1
+
+/* Define to 1 if you have the `fchmod' function. */
+#cmakedefine HAVE_FCHMOD 1
 
 /* Define to 1 if you have the `fnmatch' function. */
 #cmakedefine HAVE_FNMATCH 1
@@ -695,7 +695,7 @@ ${SIZEOF_TIME_T_CODE}
 /* if libpsl is in use */
 #cmakedefine USE_LIBPSL 1
 
-/* if you want to use OpenLDAP code instead of legacy ldap implementation */
+/* if you want to use OpenLDAP code instead of legacy LDAP implementation */
 #cmakedefine USE_OPENLDAP 1
 
 /* if OpenSSL is in use */
@@ -744,14 +744,11 @@ ${SIZEOF_TIME_T_CODE}
 /* if Unix domain sockets are enabled */
 #cmakedefine USE_UNIX_SOCKETS 1
 
-/* A build that defines USE_OPENSSL gets OpenSSL instead of Schannel */
-#ifndef USE_OPENSSL
 /* to enable SSPI support */
 #cmakedefine USE_WINDOWS_SSPI 1
 
 /* to enable Windows SSL */
 #cmakedefine USE_SCHANNEL 1
-#endif
 
 /* if Watt-32 is in use */
 #cmakedefine USE_WATT32 1
