@@ -114,6 +114,7 @@ struct ssl_connect_data {
   const struct Curl_ssl *ssl_impl;  /* TLS backend for this filter */
   struct ssl_peer peer;             /* peer the filter talks to */
   const struct alpn_spec *alpn;     /* ALPN to use or NULL for none */
+  const struct alpn_spec *alps;     /* ALPS to use or NULL for none */
   void *backend;                    /* vtls backend specific props */
   struct cf_call_data call_data;    /* data handle used in current call */
   struct Curl_ssl_session *session; /* TLS session in use or NULL */

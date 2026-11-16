@@ -48,6 +48,7 @@
 #endif
 
 #include "transfer.h"
+#include "getinfo.h"
 #include "sendf.h"
 #include "curl_trc.h"
 #include "formdata.h"
@@ -82,9 +83,10 @@
 #include "hsts.h"
 #include "rtsp.h"
 #include "ws.h"
+#include "curl_ctype.h"
+#include "slist.h"
 #include "bufref.h"
 #include "curlx/strparse.h"
-
 void Curl_http_neg_init(struct Curl_easy *data, struct http_negotiation *neg)
 {
   memset(neg, 0, sizeof(*neg));
@@ -1431,6 +1433,16 @@ CURLcode Curl_http_follow(struct Curl_easy *data, const char *newurl,
   if(type == FOLLOW_FAKE)
     return follow_fake(data, follow_url, uc, reachedmax);
 
+  if((type == FOLLOW_REDIR) &&
+     (data->req.httpcode >= 300) && (data->req.httpcode < 400)) {
+    result = Curl_add_redirect(data, Curl_bufref_ptr(&data->state.url),
+                               (long)data->req.httpcode);
+    if(result) {
+      curl_free(follow_url);
+      return result;
+    }
+  }
+
   if(disallowport)
     data->state.allow_port = FALSE;
 
@@ -1805,6 +1817,17 @@ static const char *get_http_string(int httpversion)
   }
 }
 
+/*
+ * curl-impersonate:
+ * Determine whether the merged User-Agent is Firefox.
+ */
+static bool http_merged_user_agent_is_firefox(struct Curl_easy *data)
+{
+  const char *uagent = Curl_checkheaders(data, STRCONST("User-Agent"));
+
+  return uagent && strstr(&uagent[10], "Firefox/") != NULL;
+}
+
 CURLcode Curl_add_custom_headers(struct Curl_easy *data,
                                  bool is_connect, int httpversion,
                                  struct dynbuf *req)
@@ -1813,6 +1836,12 @@ CURLcode Curl_add_custom_headers(struct Curl_easy *data,
   struct curl_slist *headers;
   int numlists = 1; /* by default */
   int i;
+
+  /*
+   * curl-impersonate: Use the merged list of headers if it exists (i.e. when
+   * the CURLOPT_HTTPBASEHEADER option was set.
+   */
+  struct curl_slist *noproxyheaders = Curl_http_request_headers(data);
 
 #ifndef CURL_DISABLE_PROXY
   enum Curl_proxy_use proxy;
@@ -1824,10 +1853,11 @@ CURLcode Curl_add_custom_headers(struct Curl_easy *data,
 
   switch(proxy) {
   case HEADER_SERVER:
-    h[0] = data->set.headers;
+    h[0] = noproxyheaders;
+
     break;
   case HEADER_PROXY:
-    h[0] = data->set.headers;
+    h[0] = noproxyheaders;
     if(data->set.sep_headers) {
       h[1] = data->set.proxyheaders;
       numlists++;
@@ -1837,7 +1867,7 @@ CURLcode Curl_add_custom_headers(struct Curl_easy *data,
     if(data->set.sep_headers)
       h[0] = data->set.proxyheaders;
     else
-      h[0] = data->set.headers;
+      h[0] = noproxyheaders;
     break;
   case HEADER_CONNECT_UDP:
     if(data->set.sep_headers)
@@ -1848,7 +1878,7 @@ CURLcode Curl_add_custom_headers(struct Curl_easy *data,
   }
 #else
   (void)is_connect;
-  h[0] = data->set.headers;
+  h[0] = noproxyheaders;
 #endif
 
   /* loop through one or two lists */
@@ -1914,6 +1944,12 @@ CURLcode Curl_add_custom_headers(struct Curl_easy *data,
         ;
       else if(curlx_str_casecompare(&name, "Connection"))
         /* Connection headers are handled specially */
+        ;
+      /* curl-impersonate: Firefox sends Priority on HTTP/1.x; omit it for
+         other User-Agents. */
+      else if((httpversion < 20) &&
+              curlx_str_casecompare(&name, "Priority") &&
+              !http_merged_user_agent_is_firefox(data))
         ;
       else if((httpversion >= 20) &&
               curlx_str_casecompare(&name, "Transfer-Encoding"))
@@ -2067,6 +2103,116 @@ void Curl_http_method(struct Curl_easy *data,
   *reqp = httpreq;
 }
 
+/*
+ * curl-impersonate:
+ * Create a new linked list of headers.
+ * The new list is a merge between the "base" headers and the application given
+ * headers. The "base" headers contain curl-impersonate's list of headers
+ * used by default by the impersonated browser.
+ *
+ * The application given headers will override the "base" headers if supplied.
+ */
+CURLcode Curl_http_merge_headers(struct Curl_easy *data)
+{
+  int i;
+  int ret;
+  struct curl_slist *head;
+  struct curl_slist *dup = NULL;
+  struct curl_slist *new_list = NULL;
+  struct curl_slist *base_headers = data->state.base_headers;
+  char *uagent;
+
+  /* Select defaults for the negotiated protocol, including HTTP/2 fallback. */
+  if(data->conn && Curl_conn_http_version(data, data->conn) == 30 &&
+     data->state.http3_base_headers)
+    base_headers = data->state.http3_base_headers;
+
+  if(!base_headers)
+    return CURLE_OK;
+
+  /* Duplicate the list for temporary use. */
+  if (data->set.headers) {
+    dup = Curl_slist_duplicate(data->set.headers);
+    if(!dup)
+      return CURLE_OUT_OF_MEMORY;
+  }
+
+  for(head = base_headers; head; head = head->next) {
+    char *sep;
+    size_t prefix_len;
+    bool found = FALSE;
+    struct curl_slist *head2;
+
+    sep = strchr(head->data, ':');
+    if(!sep)
+      continue;
+
+    prefix_len = sep - head->data;
+
+    /* Check if this header was added by the application. */
+    for(head2 = dup; head2; head2 = head2->next) {
+      if(head2->data &&
+         curl_strnequal(head2->data, head->data, prefix_len) &&
+         Curl_headersep(head2->data[prefix_len]) ) {
+        new_list = curl_slist_append(new_list, head2->data);
+        /* Free and set to NULL to mark that it's been added. */
+        curlx_safefree(head2->data);
+        found = TRUE;
+        break;
+      }
+    }
+
+    /* If the user agent was set with CURLOPT_USERAGENT, but not with
+     * CURLOPT_HTTPHEADER, take it from there instead. */
+    if(!found &&
+       curl_strnequal(head->data, "User-Agent", prefix_len) &&
+       CURL_EASY_STR(data, STRING_USERAGENT) &&
+       *CURL_EASY_STR(data, STRING_USERAGENT)) {
+      uagent = curl_maprintf("User-Agent: %s",
+                             CURL_EASY_STR(data, STRING_USERAGENT));
+      if(!uagent) {
+        ret = CURLE_OUT_OF_MEMORY;
+        goto fail;
+      }
+      new_list = Curl_slist_append_nodup(new_list, uagent);
+      found = TRUE;
+    }
+
+    if (!found) {
+      new_list = curl_slist_append(new_list, head->data);
+    }
+
+    if (!new_list) {
+      ret = CURLE_OUT_OF_MEMORY;
+      goto fail;
+    }
+  }
+
+  /* Now go over any additional application-supplied headers. */
+  for(head = dup; head; head = head->next) {
+    if(head->data) {
+      new_list = curl_slist_append(new_list, head->data);
+      if(!new_list) {
+        ret = CURLE_OUT_OF_MEMORY;
+        goto fail;
+      }
+    }
+  }
+
+  curl_slist_free_all(dup);
+  /* Save the new, merged list separately, so it can be freed later. */
+  curl_slist_free_all(data->state.merged_headers);
+  data->state.merged_headers = new_list;
+
+  return CURLE_OK;
+
+fail:
+  curl_slist_free_all(dup);
+  curl_slist_free_all(new_list);
+  return ret;
+}
+
+
 static CURLcode http_set_aptr_host(struct Curl_easy *data)
 {
   struct connectdata *conn = data->conn;
@@ -2117,9 +2263,9 @@ static CURLcode http_set_aptr_host(struct Curl_easy *data)
 #endif
 
     if(!curl_strequal("Host:", ptr)) {
-      data->state.http_host = curl_maprintf("Host:%s", &ptr[5]);
-      if(!data->state.http_host)
-        return CURLE_OUT_OF_MEMORY;
+      /* Emit custom Host with the other user headers to preserve order.
+         Cookies continue to match the URL origin. */
+      data->state.http_host = NULL;
     }
   }
   else {
@@ -2511,6 +2657,231 @@ static CURLcode addexpect(struct Curl_easy *data, struct dynbuf *r,
   return CURLE_OK;
 }
 
+struct http_hdr_line {
+  const char *line;
+  size_t linelen;
+  const char *name;
+  size_t namelen;
+  bool used;
+};
+
+static const char *http_header_block_end(const char *buf, size_t blen)
+{
+  size_t i;
+
+  for(i = 0; (i + 3) < blen; i++) {
+    if(buf[i] == '\r' && buf[i + 1] == '\n' &&
+       buf[i + 2] == '\r' && buf[i + 3] == '\n')
+      return &buf[i];
+  }
+  return NULL;
+}
+
+static void http_header_order_token(const char **pp,
+                                    const char **pname,
+                                    size_t *pnamelen)
+{
+  const char *p = *pp;
+  const char *name;
+  const char *end;
+
+  while(ISBLANK(*p))
+    p++;
+  name = p;
+
+  while(*p && *p != ',')
+    p++;
+  end = p;
+  while(end > name && ISBLANK(end[-1]))
+    end--;
+
+  *pname = name;
+  *pnamelen = (size_t)(end - name);
+  *pp = p;
+}
+
+static bool http_header_name_match(const struct http_hdr_line *line,
+                                   const char *name, size_t namelen)
+{
+  return line->namelen == namelen &&
+         curl_strnequal(line->name, name, namelen);
+}
+
+static CURLcode http_header_order_add(struct dynbuf *out,
+                                      struct http_hdr_line *lines,
+                                      size_t nlines,
+                                      const char *name, size_t namelen)
+{
+  size_t i;
+
+  for(i = 0; i < nlines; i++) {
+    if(!lines[i].used && http_header_name_match(&lines[i], name, namelen)) {
+      CURLcode result = curlx_dyn_addn(out, lines[i].line, lines[i].linelen);
+      if(result)
+        return result;
+      lines[i].used = TRUE;
+    }
+  }
+  return CURLE_OK;
+}
+
+static CURLcode http_header_order_add_rest(struct dynbuf *out,
+                                           struct http_hdr_line *lines,
+                                           size_t nlines)
+{
+  size_t i;
+
+  for(i = 0; i < nlines; i++) {
+    if(!lines[i].used) {
+      CURLcode result = curlx_dyn_addn(out, lines[i].line, lines[i].linelen);
+      if(result)
+        return result;
+      lines[i].used = TRUE;
+    }
+  }
+  return CURLE_OK;
+}
+
+static const char *http_header_order_next_line(const char *p, const char *end)
+{
+  const char *nl = memchr(p, '\n', (size_t)(end - p));
+
+  return nl ? nl + 1 : end;
+}
+
+static void http_header_order_count_lines(const char *start,
+                                          const char *end,
+                                          size_t *pcount)
+{
+  const char *p = start;
+  size_t count = 0;
+
+  while(p < end) {
+    count++;
+    p = http_header_order_next_line(p, end);
+  }
+  *pcount = count;
+}
+
+static void http_header_order_parse_lines(struct http_hdr_line *lines,
+                                          size_t nlines,
+                                          const char *start,
+                                          const char *end)
+{
+  const char *p = start;
+  size_t i;
+
+  for(i = 0; (i < nlines) && (p < end); i++) {
+    const char *line = p;
+    const char *next = http_header_order_next_line(p, end);
+    const char *colon;
+
+    p = next;
+
+    lines[i].line = line;
+    lines[i].linelen = (size_t)(next - line);
+    colon = memchr(line, ':', (size_t)(next - line));
+    if(colon) {
+      lines[i].name = line;
+      lines[i].namelen = (size_t)(colon - line);
+    }
+  }
+}
+
+static CURLcode http_req_apply_header_order(struct Curl_easy *data,
+                                            struct dynbuf *r)
+{
+  const char *order = CURL_EASY_STR(data, STRING_HTTPHEADER_ORDER);
+  struct http_hdr_line *lines = NULL;
+  struct dynbuf out;
+  struct dynbuf old;
+  char *buf;
+  const char *header_end;
+  const char *header_lines_end;
+  const char *request_end;
+  const char *header_start;
+  const char *p;
+  size_t blen;
+  size_t nlines = 0;
+  CURLcode result = CURLE_OK;
+
+  if(data->conn && data->conn->scheme &&
+     (data->conn->scheme->protocol & (CURLPROTO_WS | CURLPROTO_WSS)) &&
+     CURL_EASY_STR(data, STRING_WS_HTTPHEADER_ORDER))
+    order = CURL_EASY_STR(data, STRING_WS_HTTPHEADER_ORDER);
+  else if(data->conn &&
+          (Curl_conn_http_version(data, data->conn) == 30) &&
+          CURL_EASY_STR(data, STRING_HTTP3_HTTPHEADER_ORDER))
+    order = CURL_EASY_STR(data, STRING_HTTP3_HTTPHEADER_ORDER);
+
+  if(!order)
+    return CURLE_OK;
+
+  buf = curlx_dyn_ptr(r);
+  blen = curlx_dyn_len(r);
+  if(!buf || !blen)
+    return CURLE_OK;
+
+  /* Split the completed HTTP/1-style request into ordered regions. */
+  header_end = http_header_block_end(buf, blen);
+  if(!header_end)
+    return CURLE_OK;
+  /* Include the final header line's CRLF, but not the blank line. */
+  header_lines_end = header_end + 2;
+
+  request_end = memchr(buf, '\n', (size_t)(header_end - buf));
+  if(!request_end)
+    return CURLE_OK;
+  header_start = request_end + 1;
+
+  /* Index logical header entries, preserving duplicate header lines. */
+  http_header_order_count_lines(header_start, header_lines_end, &nlines);
+  if(!nlines)
+    return CURLE_OK;
+
+  lines = curlx_calloc(nlines, sizeof(*lines));
+  if(!lines)
+    return CURLE_OUT_OF_MEMORY;
+  http_header_order_parse_lines(lines, nlines, header_start, header_lines_end);
+
+  curlx_dyn_init(&out, DYN_HTTP_REQUEST);
+  result = curlx_dyn_addn(&out, buf, (size_t)(header_start - buf));
+
+  /* Rebuild headers: requested names first, then all unlisted headers. */
+  p = order;
+  while(!result && *p) {
+    const char *name;
+    size_t namelen;
+
+    http_header_order_token(&p, &name, &namelen);
+    if(namelen)
+      result = http_header_order_add(&out, lines, nlines, name, namelen);
+    if(*p == ',')
+      p++;
+  }
+
+  if(!result)
+    result = http_header_order_add_rest(&out, lines, nlines);
+
+  if(!result)
+    result = curlx_dyn_addn(&out, header_lines_end,
+                            blen - (size_t)(header_lines_end - buf));
+
+  curlx_free(lines);
+
+  if(result) {
+    curlx_dyn_free(&out);
+    return result;
+  }
+
+  /* Replace the caller's buffer only after the rebuild succeeds. */
+  old = *r;
+  *r = out;
+  out = old;
+  curlx_dyn_free(&out);
+  return CURLE_OK;
+}
+
 static CURLcode http_add_content_hds(struct Curl_easy *data,
                                      struct dynbuf *r,
                                      int httpversion,
@@ -2597,6 +2968,8 @@ static CURLcode http_cookies(struct Curl_easy *data,
   CURLcode result = CURLE_OK;
   const char *addcookies = NULL;
   bool linecap = FALSE;
+  bool split = data->set.split_cookies &&
+    (Curl_conn_http_version(data, data->conn) >= 20);
   if(CURL_EASY_STR(data, STRING_COOKIE) &&
      !Curl_checkheaders(data, STRCONST("Cookie")) &&
      Curl_auth_allowed_to_host(data))
@@ -2621,6 +2994,22 @@ static CURLcode http_cookies(struct Curl_easy *data,
           struct Cookie *co = Curl_node_elem(n);
           if(co->value) {
             size_t add;
+            if(split) {
+              /* One cookie per header line. */
+              add = strlen(co->name) + strlen(co->value) + 1;
+              if(add + 8 >= MAX_COOKIE_HEADER_LEN) {
+                infof(data, "Restricted outgoing cookies due to header size, "
+                      "'%s' not sent", co->name);
+                linecap = TRUE;
+                break;
+              }
+              result = curlx_dyn_addf(r, "Cookie: %s=%s\r\n", co->name,
+                                      co->value);
+              if(result)
+                break;
+              count++;
+              continue;
+            }
             if(!count) {
               result = curlx_dyn_addn(r, STRCONST("Cookie: "));
               if(result)
@@ -2645,7 +3034,32 @@ static CURLcode http_cookies(struct Curl_easy *data,
       }
       Curl_share_unlock(data, CURL_LOCK_DATA_COOKIE);
     }
-    if(addcookies && !result && !linecap) {
+
+    if(addcookies && split && !result && !linecap) {
+      const char *p = addcookies;
+      while(*p) {
+        const char *start;
+        const char *end;
+        while(ISBLANK(*p) || (*p == ';'))
+          p++;
+        if(!*p)
+          break;
+        start = p;
+        while(*p && (*p != ';'))
+          p++;
+        end = p;
+        while((end > start) && ISBLANK(end[-1]))
+          end--;
+        if(end > start) {
+          result = curlx_dyn_addf(r, "Cookie: %.*s\r\n",
+                                  (int)(end - start), start);
+          if(result)
+            break;
+          count++;
+        }
+      }
+    }
+    else if(addcookies && !result && !linecap) {
       if(!count)
         result = curlx_dyn_addn(r, STRCONST("Cookie: "));
       if(!result) {
@@ -2653,7 +3067,7 @@ static CURLcode http_cookies(struct Curl_easy *data,
         count++;
       }
     }
-    if(count && !result)
+    if(count && !split && !result)
       result = curlx_dyn_addn(r, STRCONST("\r\n"));
 
     if(result)
@@ -2843,7 +3257,7 @@ static CURLcode http_add_connection_hd(struct Curl_easy *data,
   bool skip;
 
   /* Add the 1st custom "Connection: " header, if there is one */
-  for(head = data->set.headers; head; head = head->next) {
+  for(head = Curl_http_request_headers(data); head; head = head->next) {
     if(curl_strnequal(head->data, "Connection", 10) &&
        Curl_headersep(head->data[10]) &&
        !http_header_is_empty(head->data)) {
@@ -2877,7 +3291,7 @@ static CURLcode http_add_connection_hd(struct Curl_easy *data,
 
   /* Add all user-defined Connection: headers after the first */
   skip = TRUE;
-  for(head = data->set.headers; head; head = head->next) {
+  for(head = Curl_http_request_headers(data); head; head = head->next) {
     if(curl_strnequal(head->data, "Connection", 10) &&
        Curl_headersep(head->data[10]) &&
        !http_header_is_empty(head->data)) {
@@ -2982,8 +3396,7 @@ static CURLcode http_add_hd(struct Curl_easy *data,
   }
 
   case H1_HD_ACCEPT:
-    if(!Curl_checkheaders(data, STRCONST("Accept")))
-      result = curlx_dyn_add(req, "Accept: */*\r\n");
+    /* curl-impersonate: Do not add a default Accept header. */
     break;
 
   case H1_HD_TE:
@@ -3119,8 +3532,12 @@ CURLcode Curl_http(struct Curl_easy *data, bool *done)
   /* what kind of request do we need to send? */
   Curl_http_method(data, &method, &httpreq);
 
+  /* Add HTTP headers used by the selected impersonation profile. */
+  result = Curl_http_merge_headers(data);
+
   /* select host to send */
-  result = http_set_aptr_host(data);
+  if(!result)
+    result = http_set_aptr_host(data);
   /* setup the authentication headers, how that method and host are known */
   if(!result)
     result = Curl_http_output_auth(data, data->conn, method, httpreq,
@@ -3144,6 +3561,10 @@ CURLcode Curl_http(struct Curl_easy *data, bool *done)
     if(result)
       goto out;
   }
+
+  result = http_req_apply_header_order(data, &req);
+  if(result)
+    goto out;
 
   /* setup variables for the upcoming transfer and send */
   Curl_xfer_setup_sendrecv(data, FIRSTSOCKET, -1);
@@ -3593,6 +4014,14 @@ static CURLcode http_header_s(struct Curl_easy *data,
   (void)hdlen;
 #endif
 
+#ifndef CURL_DISABLE_WEBSOCKETS
+  if(data->req.upgr101 == UPGR101_WS && data->req.httpcode == 101) {
+    const char *extensions = HD_VAL(hd, hdlen, "Sec-WebSocket-Extensions:");
+    if(extensions)
+      return Curl_ws_header(data, extensions);
+  }
+#endif
+
 #ifndef CURL_DISABLE_COOKIES
   v = (data->cookies && data->state.cookie_engine) ?
     HD_VAL(hd, hdlen, "Set-Cookie:") : NULL;
@@ -3607,7 +4036,8 @@ static CURLcode http_header_s(struct Curl_easy *data,
     Curl_share_lock(data, CURL_LOCK_DATA_COOKIE, CURL_LOCK_ACCESS_SINGLE);
     result = Curl_cookie_add(data, data->cookies, v, host,
                              data->state.up.path,
-                             COOKIE_HTTPHEADER | secure_context);
+                             COOKIE_HTTPHEADER | COOKIE_RECORD |
+                             secure_context);
     Curl_share_unlock(data, CURL_LOCK_DATA_COOKIE);
     return result;
   }
@@ -4999,6 +5429,29 @@ static bool http_TE_has_token(const char *fvalue, const char *token)
   return FALSE;
 }
 
+/*
+ * curl-impersonate:
+ * Determine the position of HTTP/2 pseudo headers.
+ * The pseudo headers ":method", ":path", ":scheme", ":authority"
+ * are sent in different order by different browsers. An important part of the
+ * impersonation is ordering them like the browser does.
+ */
+static CURLcode h2_check_pseudo_header_order(const char *order)
+{
+  if(strlen(order) != 4)
+    return CURLE_BAD_FUNCTION_ARGUMENT;
+
+  // All pseudo-headers must be present
+  if(!strchr(order, 'm') ||
+     !strchr(order, 'a') ||
+     !strchr(order, 's') ||
+     !strchr(order, 'p'))
+    return CURLE_BAD_FUNCTION_ARGUMENT;
+
+  return CURLE_OK;
+}
+
+
 CURLcode Curl_http_req_to_h2(struct dynhds *h2_headers,
                              struct httpreq *req, struct Curl_easy *data)
 {
@@ -5006,6 +5459,10 @@ CURLcode Curl_http_req_to_h2(struct dynhds *h2_headers,
   struct dynhds_entry *e;
   size_t i;
   CURLcode result;
+
+  // curl-impersonate: Use the Chrome ordering by default:
+  // :method, :authority, :scheme, :path
+  char *order = "masp";
 
   DEBUGASSERT(req);
   DEBUGASSERT(h2_headers);
@@ -5036,20 +5493,46 @@ CURLcode Curl_http_req_to_h2(struct dynhds *h2_headers,
 
   Curl_dynhds_reset(h2_headers);
   Curl_dynhds_set_opts(h2_headers, DYNHDS_OPT_LOWERCASE);
-  result = Curl_dynhds_add(h2_headers, STRCONST(HTTP_PSEUDO_METHOD),
-                           req->method, strlen(req->method));
-  if(!result && scheme) {
-    result = Curl_dynhds_add(h2_headers, STRCONST(HTTP_PSEUDO_SCHEME),
-                             scheme, strlen(scheme));
+
+  /* curl-impersonate: order of pseudo headers is different from the default */
+  if(data->conn && Curl_conn_http_version(data, data->conn) == 30 &&
+     CURL_EASY_STR(data, STRING_HTTP3_PSEUDO_HEADERS_ORDER)) {
+    order = CURL_EASY_STR(data, STRING_HTTP3_PSEUDO_HEADERS_ORDER);
   }
-  if(!result && authority) {
-    result = Curl_dynhds_add(h2_headers, STRCONST(HTTP_PSEUDO_AUTHORITY),
-                             authority, strlen(authority));
+  else if(CURL_EASY_STR(data, STRING_HTTP2_PSEUDO_HEADERS_ORDER)) {
+    order = CURL_EASY_STR(data, STRING_HTTP2_PSEUDO_HEADERS_ORDER);
   }
-  if(!result && req->path) {
-    result = Curl_dynhds_add(h2_headers, STRCONST(HTTP_PSEUDO_PATH),
-                             req->path, strlen(req->path));
+
+  result = h2_check_pseudo_header_order(order);
+
+  /* curl-impersonate: add http2 pseudo headers according to the specified order. */
+  for(i = 0; !result && i < 4; ++i) {
+    switch(order[i]) {
+      case 'm':
+        result = Curl_dynhds_add(h2_headers, STRCONST(HTTP_PSEUDO_METHOD),
+                                 req->method, strlen(req->method));
+        break;
+      case 'a':
+        if(authority) {
+          result = Curl_dynhds_add(h2_headers, STRCONST(HTTP_PSEUDO_AUTHORITY),
+                                   authority, strlen(authority));
+        }
+        break;
+      case 's':
+        if(scheme) {
+          result = Curl_dynhds_add(h2_headers, STRCONST(HTTP_PSEUDO_SCHEME),
+                                   scheme, strlen(scheme));
+        }
+        break;
+      case 'p':
+        if(req->path) {
+          result = Curl_dynhds_add(h2_headers, STRCONST(HTTP_PSEUDO_PATH),
+                                   req->path, strlen(req->path));
+        }
+        break;
+    }
   }
+
   for(i = 0; !result && i < Curl_dynhds_count(&req->headers); ++i) {
     e = Curl_dynhds_getn(&req->headers, i);
     /* "TE" is special in that it is only permissible when it
@@ -5062,6 +5545,8 @@ CURLcode Curl_http_req_to_h2(struct dynhds *h2_headers,
     else if(h2_permissible_field(e)) {
       result = Curl_dynhds_add(h2_headers, e->name, e->namelen,
                                e->value, e->valuelen);
+      /* curl-impersonate: delete the option */
+      Curl_dynhds_del_opt(h2_headers, DYNHDS_OPT_LOWERCASE_VAL);
     }
   }
 

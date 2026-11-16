@@ -53,6 +53,61 @@ static size_t mime_subparts_read(char *buffer, size_t size, size_t nitems,
                                  void *instream, bool *hasread);
 static curl_off_t mime_size(curl_mimepart *part);
 
+static CURLcode mime_set_boundary(struct Curl_easy *easy, curl_mime *mime)
+{
+  const char *form_boundary = NULL;
+
+  if(easy)
+    form_boundary = CURL_EASY_STR(easy, STRING_FORM_BOUNDARY);
+
+  if(form_boundary && curl_strequal(form_boundary, "webkit")) {
+    memcpy(mime->boundary, MIME_WEBKIT_BOUNDARY_PREFIX,
+           sizeof(MIME_WEBKIT_BOUNDARY_PREFIX) - 1);
+    return Curl_rand_alnum(easy,
+                           (unsigned char *)
+                           &mime->boundary[sizeof(MIME_WEBKIT_BOUNDARY_PREFIX)
+                                           - 1],
+                           MIME_WEBKIT_BOUNDARY_CHARS + 1);
+  }
+  if(form_boundary && curl_strequal(form_boundary, "firefox")) {
+    memcpy(mime->boundary, MIME_FIREFOX_BOUNDARY_PREFIX,
+           sizeof(MIME_FIREFOX_BOUNDARY_PREFIX) - 1);
+    return Curl_rand_hex(easy,
+                         (unsigned char *)
+                         &mime->boundary[sizeof(MIME_FIREFOX_BOUNDARY_PREFIX)
+                                         - 1],
+                         MIME_FIREFOX_BOUNDARY_CHARS + 1);
+  }
+
+  memset(mime->boundary, '-', MIME_BOUNDARY_DASHES);
+  return Curl_rand_alnum(easy,
+                         (unsigned char *)
+                         &mime->boundary[MIME_BOUNDARY_DASHES],
+                         MIME_RAND_BOUNDARY_CHARS + 1);
+}
+
+CURLcode Curl_mime_set_form_boundary(struct Curl_easy *easy, curl_mime *mime)
+{
+  CURLcode result;
+  curl_mimepart *part;
+
+  if(!mime)
+    return CURLE_OK;
+
+  result = mime_set_boundary(easy, mime);
+  if(result)
+    return result;
+
+  for(part = mime->firstpart; part; part = part->nextpart) {
+    if(part->kind == MIMEKIND_MULTIPART) {
+      result = Curl_mime_set_form_boundary(easy, (curl_mime *) part->arg);
+      if(result)
+        return result;
+    }
+  }
+
+  return CURLE_OK;
+}
 /* Quoted-printable character class table.
  *
  * We cannot rely on ctype functions since quoted-printable input data
@@ -911,6 +966,7 @@ static size_t mime_subparts_read(char *buffer, size_t size, size_t nitems,
                                  void *instream, bool *hasread)
 {
   curl_mime *mime = (curl_mime *)instream;
+  size_t boundarylen = strlen(mime->boundary);
   size_t cursize = 0;
   (void)size;  /* Always 1 */
 
@@ -935,10 +991,10 @@ static size_t mime_subparts_read(char *buffer, size_t size, size_t nitems,
     case MIMESTATE_BOUNDARY2:
       if(part)
         sz = readback_bytes(&mime->state, buffer, nitems, mime->boundary,
-                            MIME_BOUNDARY_LEN, STRCONST("\r\n"));
+                            boundarylen, STRCONST("\r\n"));
       else
         sz = readback_bytes(&mime->state, buffer, nitems, mime->boundary,
-                            MIME_BOUNDARY_LEN, STRCONST("--\r\n"));
+                            boundarylen, STRCONST("--\r\n"));
       if(!sz) {
         mimesetstate(&mime->state, MIMESTATE_CONTENT, part);
       }
@@ -1245,6 +1301,7 @@ CURLcode Curl_mime_duppart(struct Curl_easy *data,
 /* Create a mime handle. */
 curl_mime *curl_mime_init(void *easy)
 {
+  struct Curl_easy *data = (struct Curl_easy *)easy;
   curl_mime *mime = curlx_malloc(sizeof(*mime));
 
   if(mime) {
@@ -1252,10 +1309,7 @@ curl_mime *curl_mime_init(void *easy)
     mime->firstpart = NULL;
     mime->lastpart = NULL;
 
-    memset(mime->boundary, '-', MIME_BOUNDARY_DASHES);
-    if(Curl_rand_alnum(easy,
-                       (unsigned char *)&mime->boundary[MIME_BOUNDARY_DASHES],
-                       MIME_RAND_BOUNDARY_CHARS + 1)) {
+    if(Curl_mime_set_form_boundary(data, mime)) {
       /* failed to get random separator, bail out */
       curlx_free(mime);
       return NULL;
@@ -1610,7 +1664,7 @@ static curl_off_t multipart_size(curl_mime *mime)
   if(!mime)
     return 0;           /* Not present -> empty. */
 
-  boundarysize = 4 + MIME_BOUNDARY_LEN + 2;
+  boundarysize = 4 + (curl_off_t) strlen(mime->boundary) + 2;
   size = boundarysize;  /* Final boundary - CRLF after headers. */
 
   for(part = mime->firstpart; part; part = part->nextpart) {

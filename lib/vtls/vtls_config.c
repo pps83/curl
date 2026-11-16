@@ -108,6 +108,51 @@ void Curl_ssl_config_init(struct ssl_easy_config *sslc)
   sslc->cache_session = TRUE; /* caching by default */
 }
 
+static const char *ssl_config_get_transport_value(const char *value,
+                                                  const char *http3_value,
+                                                  uint8_t transport)
+{
+  if((transport == TRNSPRT_QUIC) && http3_value)
+    return http3_value;
+  return value;
+}
+
+const char *Curl_ssl_config_get_curves(
+  const struct ssl_filter_config *sslc, uint8_t transport)
+{
+  return ssl_config_get_transport_value(sslc->curves, sslc->http3_curves,
+                                        transport);
+}
+
+const char *Curl_ssl_config_get_signature_algorithms(
+  const struct ssl_filter_config *sslc, uint8_t transport)
+{
+  return ssl_config_get_transport_value(sslc->signature_algorithms,
+                                        sslc->http3_signature_algorithms,
+                                        transport);
+}
+
+const char *Curl_ssl_config_get_tls_extension_order(
+  const struct ssl_filter_config *sslc, uint8_t transport)
+{
+  return ssl_config_get_transport_value(sslc->tls_extension_order,
+                                        sslc->http3_tls_extension_order,
+                                        transport);
+}
+
+bool Curl_ssl_http3_permute_extensions(const struct Curl_easy *data)
+{
+  switch(data->set.http3_ssl_permute_extensions) {
+  case CURL_HTTP3_SSL_PERMUTE_DISABLE:
+    return FALSE;
+  case CURL_HTTP3_SSL_PERMUTE_ENABLE:
+    return TRUE;
+  case CURL_HTTP3_SSL_PERMUTE_FALLBACK:
+  default:
+    return data->set.ssl_permute_extensions;
+  }
+}
+
 void Curl_ssl_config_cleanup(struct ssl_filter_config *sslc)
 {
   if(sslc->deep_copy) {
@@ -123,7 +168,13 @@ void Curl_ssl_config_cleanup(struct ssl_filter_config *sslc)
     curlx_safefree(sslc->issuercert_blob);
     curlx_safefree(sslc->key_blob);
     curlx_safefree(sslc->curves);
+    curlx_safefree(sslc->tls_extension_order);
+    curlx_safefree(sslc->cert_compression);
     curlx_safefree(sslc->signature_algorithms);
+    curlx_safefree(sslc->http3_curves);
+    curlx_safefree(sslc->http3_signature_algorithms);
+    curlx_safefree(sslc->http3_tls_extension_order);
+    curlx_safefree(sslc->trust_anchors);
     curlx_safefree(sslc->CRLfile);
     curlx_safefree(sslc->cert_type);
     curlx_safefree(sslc->key);
@@ -149,6 +200,9 @@ static bool match_ssl_primary_config(struct Curl_easy *data,
      (c1->verifypeer == c2->verifypeer) &&
      (c1->verifyhost == c2->verifyhost) &&
      (c1->verifystatus == c2->verifystatus) &&
+     (c1->enable_ticket == c2->enable_ticket) &&
+     (c1->http3_ssl_permute_extensions ==
+      c2->http3_ssl_permute_extensions) &&
      (c1->auto_client_cert == c2->auto_client_cert) &&
 #ifdef USE_ECH
      (c1->ech == c2->ech) &&
@@ -166,7 +220,15 @@ static bool match_ssl_primary_config(struct Curl_easy *data,
      curl_strequal(c1->cipher_list, c2->cipher_list) &&
      curl_strequal(c1->cipher_list13, c2->cipher_list13) &&
      curl_strequal(c1->curves, c2->curves) &&
+     curl_strequal(c1->tls_extension_order, c2->tls_extension_order) &&
+     curl_strequal(c1->cert_compression, c2->cert_compression) &&
      curl_strequal(c1->signature_algorithms, c2->signature_algorithms) &&
+     curl_strequal(c1->http3_curves, c2->http3_curves) &&
+     curl_strequal(c1->http3_signature_algorithms,
+                   c2->http3_signature_algorithms) &&
+     curl_strequal(c1->http3_tls_extension_order,
+                   c2->http3_tls_extension_order) &&
+     curl_strequal(c1->trust_anchors, c2->trust_anchors) &&
      Curl_safecmp(c1->CRLfile, c2->CRLfile) &&
      Curl_safecmp(c1->pinned_key, c2->pinned_key) &&
      curl_strequal(c1->cert_type, c2->cert_type) &&
@@ -207,6 +269,9 @@ static bool clone_ssl_primary_config(struct ssl_filter_config *source,
   dest->ssl_options = source->ssl_options;
   dest->native_ca_store = source->native_ca_store;
   dest->cache_session = source->cache_session;
+  dest->enable_ticket = source->enable_ticket;
+  dest->http3_ssl_permute_extensions =
+    source->http3_ssl_permute_extensions;
   dest->auto_client_cert = source->auto_client_cert;
   dest->earlydata = source->earlydata;
   dest->enable_beast = source->enable_beast;
@@ -224,7 +289,13 @@ static bool clone_ssl_primary_config(struct ssl_filter_config *source,
   CLONE_STRING(cipher_list13);
   CLONE_STRING(pinned_key);
   CLONE_STRING(curves);
+  CLONE_STRING(tls_extension_order);
+  CLONE_STRING(cert_compression);
   CLONE_STRING(signature_algorithms);
+  CLONE_STRING(http3_curves);
+  CLONE_STRING(http3_signature_algorithms);
+  CLONE_STRING(http3_tls_extension_order);
+  CLONE_STRING(trust_anchors);
   CLONE_STRING(CRLfile);
   /* SSL credentials: client certificate */
   CLONE_STRING(clientcert);
@@ -269,12 +340,14 @@ static char *ssl_easy_steal(struct Curl_easy *data, enum dupstring id)
   return CURL_UNCONST(CURL_EASY_STR(data, id));
 }
 
-CURLcode Curl_ssl_filter_config_tmp_init(
+static CURLcode ssl_filter_config_tmp_init(
   struct Curl_easy *data, struct Curl_peer *origin,
   struct ssl_filter_config *ssl_origin,
-  struct ssl_filter_config *ssl_proxy)
+  struct ssl_filter_config *ssl_proxy, const struct connectdata *conn)
 {
   struct ssl_easy_config *sslc = &data->set.ssl;
+  const bool is_wss = conn && conn->scheme &&
+    (conn->scheme->protocol & CURLPROTO_WSS);
 #if defined(CURL_CA_PATH) || defined(CURL_CA_BUNDLE)
   CURLcode result;
 #endif
@@ -319,6 +392,29 @@ CURLcode Curl_ssl_filter_config_tmp_init(
     ssl_easy_steal(data, STRING_SSL_SIGNATURE_ALGORITHMS);
   ssl_origin->ca_info_blob = data->set.blobs[BLOB_CAINFO];
   ssl_origin->curves = ssl_easy_steal(data, STRING_SSL_EC_CURVES);
+  ssl_origin->tls_extension_order =
+    ssl_easy_steal(data, STRING_TLS_EXTENSION_ORDER);
+  ssl_origin->cert_compression =
+    ssl_easy_steal(data, STRING_SSL_CERT_COMPRESSION);
+  ssl_origin->http3_curves =
+    ssl_easy_steal(data, STRING_HTTP3_SSL_EC_CURVES);
+  ssl_origin->http3_signature_algorithms =
+    ssl_easy_steal(data, STRING_HTTP3_SIG_HASH_ALGS);
+  ssl_origin->http3_tls_extension_order =
+    ssl_easy_steal(data, STRING_HTTP3_TLS_EXTENSION_ORDER);
+  ssl_origin->enable_ticket = data->set.ssl_enable_ticket;
+  ssl_origin->trust_anchors =
+    ssl_easy_steal(data, STRING_TLS_TRUST_ANCHORS);
+  ssl_origin->http3_ssl_permute_extensions =
+    Curl_ssl_http3_permute_extensions(data);
+
+  if(is_wss) {
+    if(data->set.ws_disable_session_ticket)
+      ssl_origin->enable_ticket = FALSE;
+    if(CURL_EASY_STR(data, STRING_WS_SSL_CERT_COMPRESSION))
+      ssl_origin->cert_compression =
+        ssl_easy_steal(data, STRING_WS_SSL_CERT_COMPRESSION);
+  }
   /* Maybe these should not be used for another origin. But for
    * backwards compatibility, keep them in. */
   ssl_origin->issuercert = ssl_easy_steal(data, STRING_SSL_ISSUERCERT);
@@ -399,6 +495,7 @@ CURLcode Curl_ssl_filter_config_tmp_init(
     ssl_easy_steal(data, STRING_SSL_CIPHER13_LIST_PROXY);
   ssl_proxy->pinned_key =
     ssl_easy_steal(data, STRING_SSL_PINNEDPUBLICKEY_PROXY);
+  ssl_proxy->enable_ticket = data->set.ssl_enable_ticket;
   ssl_proxy->cert_blob = data->set.blobs[BLOB_CERT_PROXY];
   ssl_proxy->ca_info_blob = data->set.blobs[BLOB_CAINFO_PROXY];
   ssl_proxy->issuercert = ssl_easy_steal(data, STRING_SSL_ISSUERCERT_PROXY);
@@ -421,6 +518,23 @@ CURLcode Curl_ssl_filter_config_tmp_init(
 #endif /* CURL_DISABLE_PROXY */
 
   return CURLE_OK;
+}
+
+CURLcode Curl_ssl_filter_config_tmp_init(
+  struct Curl_easy *data, struct Curl_peer *origin,
+  struct ssl_filter_config *ssl_origin,
+  struct ssl_filter_config *ssl_proxy)
+{
+  return ssl_filter_config_tmp_init(data, origin, ssl_origin, ssl_proxy, NULL);
+}
+
+CURLcode Curl_ssl_filter_config_tmp_init_conn(
+  struct Curl_easy *data, struct connectdata *conn,
+  struct ssl_filter_config *ssl_origin,
+  struct ssl_filter_config *ssl_proxy)
+{
+  return ssl_filter_config_tmp_init(data, conn->origin, ssl_origin, ssl_proxy,
+                                     conn);
 }
 
 CURLcode Curl_ssl_conn_config_clone(struct ssl_filter_config *ssl_config,

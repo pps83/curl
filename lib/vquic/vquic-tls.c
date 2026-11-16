@@ -52,7 +52,8 @@
 CURLcode Curl_vquic_tls_peer_init(struct Curl_peer *origin,
                                   struct Curl_peer *peer,
                                   struct ssl_filter_config *sslc,
-                                  struct ssl_peer *ssl_peer)
+                                  struct ssl_peer *ssl_peer,
+                                  struct connectdata *conn)
 {
   char tls_id[80];
 
@@ -69,20 +70,24 @@ CURLcode Curl_vquic_tls_peer_init(struct Curl_peer *origin,
   if(ssl_peer->origin || ssl_peer->peer)
     Curl_ssl_peer_cleanup(ssl_peer);
   return Curl_ssl_peer_init(ssl_peer, origin, peer, sslc,
-                            tls_id, TRNSPRT_QUIC);
+                            tls_id, TRNSPRT_QUIC, conn);
 }
 
 CURLcode Curl_vquic_tls_init(struct curl_tls_ctx *ctx,
                              struct Curl_cfilter *cf,
                              struct Curl_easy *data,
+                             struct cf_call_data *call_data,
                              struct ssl_peer *ssl_peer,
                              const struct alpn_spec *alpns,
                              Curl_vquic_tls_ctx_setup *cb_setup,
                              void *cb_user_data, void *ssl_user_data,
                              Curl_vquic_session_reuse_cb *session_reuse_cb)
 {
+#ifndef USE_OPENSSL
+  (void)call_data;
+#endif
 #ifdef USE_OPENSSL
-  return Curl_ossl_ctx_init(&ctx->ossl, cf, data, ssl_peer, alpns,
+  return Curl_ossl_ctx_init(&ctx->ossl, cf, data, call_data, ssl_peer, alpns,
                             cb_setup, cb_user_data, NULL, ssl_user_data,
                             session_reuse_cb);
 #elif defined(USE_GNUTLS)

@@ -243,6 +243,7 @@ LIB_CFILES =         \
   idn.c              \
   if2ip.c            \
   imap.c             \
+  impersonate.c      \
   ldap.c             \
   llist.c            \
   macos.c            \

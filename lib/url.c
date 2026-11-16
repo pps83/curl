@@ -175,6 +175,12 @@ void Curl_freeset(struct Curl_easy *data)
   curl_slist_free_all(data->state.cookielist);
   data->state.cookielist = NULL;
 #endif
+  curl_slist_free_all(data->state.base_headers);
+  data->state.base_headers = NULL;
+  curl_slist_free_all(data->state.http3_base_headers);
+  data->state.http3_base_headers = NULL;
+  curl_slist_free_all(data->state.merged_headers);
+  data->state.merged_headers = NULL;
 }
 
 /* free the URL pieces */
@@ -270,6 +276,8 @@ CURLcode Curl_close(struct Curl_easy **datap)
   curlx_safefree(data->state.most_recent_ftp_entrypath);
   curlx_safefree(data->info.contenttype);
   curlx_safefree(data->info.wouldredirect);
+  curl_slist_free_all(data->info.cookiechanges);
+  Curl_free_redirects(data);
   curlx_safefree(data->info.effective_url);
 
   /* No longer a dirty share, if it exists */
@@ -285,7 +293,6 @@ CURLcode Curl_close(struct Curl_easy **datap)
 #ifndef CURL_DISABLE_COOKIES
   curlx_safefree(data->req.cookiehost);
 #endif
-
 #if !defined(CURL_DISABLE_HTTP) && !defined(CURL_DISABLE_FORM_API)
   Curl_mime_cleanpart(data->state.formp);
   curlx_safefree(data->state.formp);
@@ -395,6 +402,7 @@ void Curl_init_userdefined(struct Curl_easy *data)
   Curl_setopt_SSLVERSION(data, CURLOPT_PROXY_SSLVERSION,
                          CURL_SSLVERSION_DEFAULT);
 #endif
+  set->ssl_version_set = FALSE;
 #endif
 #ifndef CURL_DISABLE_FTP
   set->wildcard_enabled = FALSE;
@@ -409,8 +417,17 @@ void Curl_init_userdefined(struct Curl_easy *data)
   set->tcp_fastopen = FALSE;
   set->tcp_nodelay = TRUE;
   set->ssl_enable_alpn = TRUE;
+  set->ssl_enable_ticket = TRUE;
+  set->http3_ssl_permute_extensions =
+    CURL_HTTP3_SSL_PERMUTE_FALLBACK;
+  set->quic_initial_packet_number = 0;
+  set->tls_grease = FALSE;
+  set->tls_use_new_alps_codepoint = FALSE;
   set->expect_100_timeout = 1000L; /* Wait for a second by default. */
   set->sep_headers = TRUE; /* separated header lists by default */
+#ifndef CURL_DISABLE_COOKIES
+  set->split_cookies = FALSE; /* use a single Cookie header by default */
+#endif
   set->buffer_size = READBUFFER_SIZE;
   set->upload_buffer_size = UPLOADBUFFER_DEFAULT;
   set->upload_flags = CURLULFLAG_SEEN;
@@ -502,6 +519,9 @@ void Curl_conn_free(struct Curl_easy *data, struct connectdata *conn)
 
   for(i = 0; i < (int8_t)CURL_ARRAYSIZE(conn->cfilter); ++i) {
     Curl_conn_cf_discard_all(data, conn, i);
+#if defined(USE_OPENSSL) && defined(HAVE_SSL_SET1_ECH_CONFIG_LIST)
+    curlx_safefree(conn->ech_retry_configs[i]);
+#endif
   }
 
 #ifndef CURL_DISABLE_PROXY
@@ -1148,6 +1168,10 @@ static struct connectdata *allocate_conn(struct Curl_easy *data)
 #endif
   conn->ip_version = data->set.ipver;
   conn->bits.connect_only = (bool)data->set.connect_only;
+#ifndef CURL_DISABLE_PROXY
+  conn->bits.proxy_credential_no_reuse =
+    data->set.proxy_credential_no_reuse;
+#endif
   conn->transport_wanted = TRNSPRT_TCP; /* most of them are TCP streams */
 
   /* Store the local bind parameters that will be used for this connection */
@@ -2036,6 +2060,11 @@ static CURLcode url_create_needle(struct Curl_easy *data,
        (default) */
     if(data->set.ssl_enable_alpn)
       needle->bits.tls_enable_alpn = TRUE;
+
+    /* curl-impersonate: Turn on ALPS when requested for a protocol which
+     * supports ALPN. */
+    if(data->set.ssl_enable_alps)
+      needle->bits.tls_enable_alps = TRUE;
   }
 
   if(network_scheme) {
@@ -2253,7 +2282,7 @@ static CURLcode url_match_init(struct Curl_easy *data,
   m->may_tls = data->set.use_ssl > CURLUSESSL_NONE;
 
   /* Get a shallow setup of filter configs for connection cache matching */
-  return Curl_ssl_filter_config_tmp_init(data, needle->origin,
+  return Curl_ssl_filter_config_tmp_init_conn(data, needle,
                                          &m->ssl_config,
 #ifndef CURL_DISABLE_PROXY
                                          &m->proxy_ssl_config);
@@ -2576,6 +2605,7 @@ CURLcode Curl_init_transfer(struct Curl_easy *data, struct connectdata *conn)
 void Curl_data_priority_clear_state(struct Curl_easy *data)
 {
   data->state.weight = 0;
+  data->state.stream_exclusive = FALSE;
 }
 
 #endif /* USE_HTTP2 || USE_HTTP3 */

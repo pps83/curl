@@ -428,8 +428,23 @@ CURLWARNING(Wcurl_easy_getinfo_err_curl_off_t,
    (option) == CURLOPT_FTP_ACCOUNT ||                                   \
    (option) == CURLOPT_FTP_ALTERNATIVE_TO_USER ||                       \
    (option) == CURLOPT_FTPPORT ||                                       \
+   (option) == CURLOPT_FORM_BOUNDARY ||                                 \
    (option) == CURLOPT_HAPROXY_CLIENT_IP ||                             \
    (option) == CURLOPT_HSTS ||                                          \
+   (option) == CURLOPT_HTTPHEADER_ORDER ||                              \
+   (option) == CURLOPT_HTTP2_PSEUDO_HEADERS_ORDER ||                    \
+   (option) == CURLOPT_HTTP2_SETTINGS ||                                \
+   (option) == CURLOPT_HTTP2_STREAMS ||                                 \
+   (option) == CURLOPT_HTTP3_HTTPHEADER_ORDER ||                        \
+   (option) == CURLOPT_HTTP3_PSEUDO_HEADERS_ORDER ||                    \
+   (option) == CURLOPT_HTTP3_SETTINGS ||                                \
+   (option) == CURLOPT_HTTP3_SIG_HASH_ALGS ||                           \
+   (option) == CURLOPT_HTTP3_SSL_EC_CURVES ||                           \
+   (option) == CURLOPT_HTTP3_TLS_EXTENSION_ORDER ||                     \
+   (option) == CURLOPT_QUIC_CID_LENGTH ||                               \
+   (option) == CURLOPT_QUIC_TRANSPORT_PARAMETERS ||                     \
+   (option) == CURLOPT_WS_HTTPHEADER_ORDER ||                           \
+   (option) == CURLOPT_WS_SSL_CERT_COMPRESSION ||                       \
    (option) == CURLOPT_INTERFACE ||                                     \
    (option) == CURLOPT_ISSUERCERT ||                                    \
    (option) == CURLOPT_KEYPASSWD ||                                     \
@@ -549,6 +564,8 @@ CURLWARNING(Wcurl_easy_getinfo_err_curl_off_t,
 #define curlcheck_slist_option(option)                                  \
   ((option) == CURLOPT_HTTP200ALIASES ||                                \
    (option) == CURLOPT_HTTPHEADER ||                                    \
+   (option) == CURLOPT_HTTP3_HTTPHEADER ||                              \
+   (option) == CURLOPT_WS_HTTPHEADER ||                                 \
    (option) == CURLOPT_MAIL_RCPT ||                                     \
    (option) == CURLOPT_POSTQUOTE ||                                     \
    (option) == CURLOPT_PREQUOTE ||                                      \
@@ -577,7 +594,9 @@ CURLWARNING(Wcurl_easy_getinfo_err_curl_off_t,
 /* true if info expects a pointer to struct curl_slist * argument */
 #define curlcheck_slist_info(info)                                      \
   (((info) == CURLINFO_SSL_ENGINES) ||                                  \
-   ((info) == CURLINFO_COOKIELIST))
+   ((info) == CURLINFO_COOKIELIST) ||                                   \
+   ((info) == CURLINFO_COOKIECHANGES) ||                                \
+   ((info) == CURLINFO_REDIRECT_HISTORY))
 
 /* true if info expects a pointer to struct curl_tlssessioninfo * argument */
 #define curlcheck_tlssessioninfo_info(info)                             \

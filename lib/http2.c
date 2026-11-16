@@ -46,6 +46,7 @@
 #include "bufref.h"
 #include "curlx/dynbuf.h"
 #include "headers.h"
+#include "curlx/strdup.h"
 #include "curl_share.h"
 
 #if NGHTTP2_VERSION_NUM < 0x010f00
@@ -64,11 +65,13 @@
 /* on send into TLS, we want to accumulate small frames */
 #define H2_NW_SEND_CHUNKS       1
 /* this is how much we want "in flight" for a stream, unthrottled */
-#define H2_STREAM_WINDOW_SIZE_MAX   (10 * 1024 * 1024)
+/* curl-impersonate: match Chrome's stream window. */
+#define H2_STREAM_WINDOW_SIZE_MAX   (1024 * 1024)
 /* this is how much we want "in flight" for a stream, initially, IFF
  * nghttp2 allows us to tweak the local window size. */
 #if NGHTTP2_HAS_SET_LOCAL_WINDOW_SIZE
-#define H2_STREAM_WINDOW_SIZE_INITIAL  (64 * 1024)
+/* curl-impersonate: match Chrome's initial stream window. */
+#define H2_STREAM_WINDOW_SIZE_INITIAL  (1024 * 1024)
 #else
 #define H2_STREAM_WINDOW_SIZE_INITIAL H2_STREAM_WINDOW_SIZE_MAX
 #endif
@@ -82,9 +85,10 @@
  * the overall connection. Streams might become PAUSED which will block their
  * received QUOTA in the connection window. If we run out of space, the server
  * is blocked from sending us any data. See #10988 for an issue with this. */
-#define HTTP2_HUGE_WINDOW_SIZE (100 * H2_STREAM_WINDOW_SIZE_MAX)
+/* curl-impersonate: match Chrome's connection window. */
+#define HTTP2_HUGE_WINDOW_SIZE (15 * H2_STREAM_WINDOW_SIZE_MAX)
 
-#define H2_SETTINGS_IV_LEN 3
+#define H2_SETTINGS_IV_LEN 8
 #define H2_BINSETTINGS_LEN 80
 
 struct cf_h2_ctx {
@@ -218,17 +222,72 @@ static size_t populate_settings(nghttp2_settings_entry *iv,
                                 struct Curl_easy *data,
                                 struct cf_h2_ctx *ctx)
 {
-  iv[0].settings_id = NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS;
-  iv[0].value = Curl_multi_max_concurrent_streams(data->multi);
+  /* curl-impersonate: set the HTTP/2 SETTINGS frame as instructed by the
+   * application. Format example: 1:65536;2:0;4:6291456;6:262144
+   * See https://httpwg.org/specs/rfc7540.html#SETTINGS. */
+  const char *settings = CURL_EASY_STR(data, STRING_HTTP2_SETTINGS);
+  char *copy;
+  char *setting;
+  size_t i = 0;
 
-  iv[1].settings_id = NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE;
-  iv[1].value = cf_h2_initial_win_size(data);
-  if(ctx)
-    ctx->initial_win_size = iv[1].value;
-  iv[2].settings_id = NGHTTP2_SETTINGS_ENABLE_PUSH;
-  iv[2].value = !!data->multi->push_cb;
+  /* TODO: validate setting IDs and values before submitting them. */
+  /* Use Chrome's settings as the default. */
+  if(!settings)
+    settings = "1:65536;2:0;4:6291456;6:262144";
+  copy = curlx_strdup(settings);
+  if(!copy)
+    return 0;
 
-  return 3;
+  for(setting = strtok(copy, ";"); setting && i < H2_SETTINGS_IV_LEN;
+      setting = strtok(NULL, ";")) {
+    unsigned long value = strtoul(setting + 2, NULL, 10);
+    switch(setting[0]) {
+    case '1':
+      iv[i].settings_id = NGHTTP2_SETTINGS_HEADER_TABLE_SIZE;
+      break;
+    case '2':
+      iv[i].settings_id = NGHTTP2_SETTINGS_ENABLE_PUSH;
+      break;
+    case '3':
+      /* FIXME: We also need to notify curl_multi about this setting. */
+      iv[i].settings_id = NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS;
+      break;
+    case '4':
+      iv[i].settings_id = NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE;
+      if(ctx)
+        ctx->initial_win_size = (uint32_t)value;
+      break;
+    case '5':
+      iv[i].settings_id = NGHTTP2_SETTINGS_MAX_FRAME_SIZE;
+      break;
+    case '6':
+      iv[i].settings_id = NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE;
+      break;
+    case '8':
+      /* RFC 8441 extended CONNECT. */
+      iv[i].settings_id = NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL;
+      break;
+    case '9':
+      /* RFC 9218 extensible priorities. */
+      iv[i].settings_id = NGHTTP2_SETTINGS_NO_RFC7540_PRIORITIES;
+      break;
+    default:
+      continue;
+    }
+    iv[i].value = (uint32_t)value;
+    i++;
+  }
+  curlx_free(copy);
+
+  /* Up to Chrome 98, the SETTINGS frame contained a randomly chosen setting
+   * number, possibly as a form of GREASE. It has since been removed.
+   *
+   * Curl_rand(data, (unsigned char *)&iv[4].settings_id,
+   *           sizeof(iv[4].settings_id));
+   * Curl_rand(data, (unsigned char *)&iv[4].value,
+   *           sizeof(iv[4].value));
+   */
+  return i;
 }
 
 static ssize_t populate_binsettings(uint8_t *binsettings,
@@ -253,6 +312,101 @@ static CURLcode cf_h2_update_settings(struct cf_h2_ctx *ctx,
     return CURLE_SEND_ERROR;
   ctx->initial_win_size = initial_win_size;
   return CURLE_OK;
+}
+
+/* HTTP/2 priorities are deprecated, but retain this helper for Firefox
+ * impersonation profiles which use the legacy priority tree. */
+static CURLcode http2_set_stream_priority(struct Curl_cfilter *cf,
+                                          struct Curl_easy *data,
+                                          int32_t stream_id,
+                                          int32_t dep_stream_id,
+                                          int32_t weight,
+                                          int exclusive)
+{
+  int rv;
+  struct cf_h2_ctx *ctx = cf->ctx;
+  nghttp2_priority_spec pri_spec;
+
+  nghttp2_priority_spec_init(&pri_spec, dep_stream_id, weight, exclusive);
+  rv = nghttp2_submit_priority(ctx->h2, NGHTTP2_FLAG_NONE,
+                               stream_id, &pri_spec);
+  if(rv) {
+    failf(data, "nghttp2_submit_priority() failed: %s(%d)",
+          nghttp2_strerror(rv), rv);
+    return CURLE_HTTP2;
+  }
+
+  return CURLE_OK;
+}
+
+/*
+ * curl-impersonate: Firefox used an elaborate scheme of HTTP/2 streams to
+ * split the load for HTML, JavaScript, CSS and images. It built a tree of
+ * streams with different weights and communicated it to the server. Retain
+ * the path even though legacy HTTP/2 priorities are deprecated.
+ */
+static CURLcode http2_set_stream_priorities(struct Curl_cfilter *cf,
+                                            struct Curl_easy *data)
+{
+  CURLcode result;
+  char *copy;
+  char *stream;
+
+  if(!CURL_EASY_STR(data, STRING_HTTP2_STREAMS))
+    return CURLE_OK;
+
+  copy = curlx_strdup(CURL_EASY_STR(data, STRING_HTTP2_STREAMS));
+  if(!copy)
+    return CURLE_OUT_OF_MEMORY;
+
+  stream = copy;
+  while(stream) {
+    char *next_stream = strchr(stream, ',');
+    char *value;
+    int32_t stream_id;
+    int exclusive;
+    int32_t dep_stream_id;
+    int32_t weight;
+
+    if(next_stream)
+      *next_stream++ = '\0';
+
+    if(!*stream)
+      break;
+
+    value = strtok(stream, ":");
+    if(!value)
+      goto malformed;
+    stream_id = (int32_t)atoi(value);
+    value = strtok(NULL, ":");
+    if(!value)
+      goto malformed;
+    exclusive = atoi(value);
+    value = strtok(NULL, ":");
+    if(!value)
+      goto malformed;
+    dep_stream_id = (int32_t)atoi(value);
+    value = strtok(NULL, ":");
+    if(!value)
+      goto malformed;
+    weight = (int32_t)atoi(value);
+
+    result = http2_set_stream_priority(cf, data, stream_id, dep_stream_id,
+                                       weight, exclusive);
+    if(result) {
+      curlx_free(copy);
+      return result;
+    }
+
+    stream = next_stream;
+  }
+
+  curlx_free(copy);
+  return CURLE_OK;
+
+malformed:
+  curlx_free(copy);
+  return CURLE_BAD_FUNCTION_ARGUMENT;
 }
 
 #define H2_STREAM_CTX(ctx, data)                                         \
@@ -1773,18 +1927,26 @@ out:
   return result;
 }
 
+/*
+ * curl-impersonate: use Chrome's default HTTP/2 stream weight instead of
+ * nghttp2's default stream weight.
+ */
+#define CHROME_DEFAULT_STREAM_WEIGHT  256
+#define SAFARI_DEFAULT_STREAM_WEIGHT  255
+#define FIREFOX_DEFAULT_STREAM_WEIGHT 42
+
 static int sweight_wanted(const struct Curl_easy *data)
 {
   /* 0 weight is not set by user and we take the nghttp2 default one */
   return data->set.weight ?
-    data->set.weight : NGHTTP2_DEFAULT_WEIGHT;
+    data->set.weight : CHROME_DEFAULT_STREAM_WEIGHT;
 }
 
 static int sweight_in_effect(const struct Curl_easy *data)
 {
   /* 0 weight is not set by user and we take the nghttp2 default one */
   return data->state.weight ?
-    data->state.weight : NGHTTP2_DEFAULT_WEIGHT;
+    data->state.weight : CHROME_DEFAULT_STREAM_WEIGHT;
 }
 
 /*
@@ -1793,12 +1955,23 @@ static int sweight_in_effect(const struct Curl_easy *data)
  * struct.
  */
 
+/*
+ * curl-impersonate: Firefox used stream 13 as the parent of the stream which
+ * fetched the main HTML resource.
+ */
+#define FIREFOX_DEFAULT_STREAM_DEP 13
+
 static void h2_pri_spec(struct Curl_easy *data,
                         nghttp2_priority_spec *pri_spec)
 {
-  int prio = data->set.weight;
-  nghttp2_priority_spec_init(pri_spec, 0, sweight_wanted(data), FALSE);
-  data->state.weight = prio;
+  /* curl-impersonate: use the configured exclusive flag from data->set.
+   * The dependency ID can be changed to FIREFOX_DEFAULT_STREAM_DEP for the
+   * legacy Firefox priority path. */
+  nghttp2_priority_spec_init(pri_spec, 0,
+                             sweight_wanted(data),
+                             data->set.stream_exclusive);
+  data->state.weight = data->set.weight;
+  data->state.stream_exclusive = data->set.stream_exclusive;
 }
 
 /*
@@ -1811,16 +1984,19 @@ static CURLcode h2_progress_egress(struct Curl_cfilter *cf,
                                    struct Curl_easy *data)
 {
   struct cf_h2_ctx *ctx = cf->ctx;
+  struct h2_stream_ctx *stream = H2_STREAM_CTX(ctx, data);
   int rv = 0;
 
-  if(sweight_wanted(data) != sweight_in_effect(data)) {
-    struct h2_stream_ctx *stream = H2_STREAM_CTX(ctx, data);
-    if(stream && stream->id > 0 &&
-       (sweight_wanted(data) != sweight_in_effect(data))) {
-      /* send new weight and/or dependency */
-      nghttp2_priority_spec pri_spec;
+  /* curl-impersonate: also detect a change to the exclusive flag. */
+  if(stream && stream->id > 0 &&
+     ((sweight_wanted(data) != sweight_in_effect(data)) ||
+      (data->set.stream_exclusive != data->state.stream_exclusive))) {
+    /* send new weight and/or dependency */
+    nghttp2_priority_spec pri_spec;
 
-      h2_pri_spec(data, &pri_spec);
+    h2_pri_spec(data, &pri_spec);
+    /* curl-impersonate: do not send PRIORITY frames for the main stream. */
+    if(stream->id != 1) {
       CURL_TRC_CF(data, cf, "[%d] Queuing PRIORITY", stream->id);
       DEBUGASSERT(stream->id != -1);
       rv = nghttp2_submit_priority(ctx->h2, NGHTTP2_FLAG_NONE,
@@ -2137,7 +2313,9 @@ static CURLcode h2_submit(struct h2_stream_ctx **pstream,
   /* Check the initial windows size of the transfer (rate-limits?) and
    * send an updated settings on changes from previous value. */
   initial_win_size = cf_h2_initial_win_size(data);
-  if(initial_win_size != ctx->initial_win_size) {
+  /* curl-impersonate: keep an explicitly configured SETTINGS fingerprint. */
+  if(!CURL_EASY_STR(data, STRING_HTTP2_SETTINGS) &&
+     (initial_win_size != ctx->initial_win_size)) {
     result = cf_h2_update_settings(ctx, initial_win_size);
     if(result)
       goto out;
@@ -2150,11 +2328,13 @@ static CURLcode h2_submit(struct h2_stream_ctx **pstream,
   case HTTPREQ_PUT:
     data_prd.read_callback = req_body_read_callback;
     data_prd.source.ptr = NULL;
-    stream_id = nghttp2_submit_request(ctx->h2, &pri_spec, nva, nheader,
+    stream_id = nghttp2_submit_request(
+      ctx->h2, data->set.http2_no_priority ? NULL : &pri_spec, nva, nheader,
                                        &data_prd, stream);
     break;
   default:
-    stream_id = nghttp2_submit_request(ctx->h2, &pri_spec, nva, nheader,
+    stream_id = nghttp2_submit_request(
+      ctx->h2, data->set.http2_no_priority ? NULL : &pri_spec, nva, nheader,
                                        NULL, stream);
   }
 
@@ -2488,14 +2668,35 @@ static CURLcode cf_h2_ctx_open(struct Curl_cfilter *cf,
     }
   }
 
-  rc = nghttp2_session_set_local_window_size(ctx->h2, NGHTTP2_FLAG_NONE, 0,
-                                             HTTP2_HUGE_WINDOW_SIZE);
+  {
+    /* curl-impersonate: directly change the connection window using the
+     * configured increment, with Chrome's increment as the default. */
+    int current_window = nghttp2_session_get_local_window_size(ctx->h2);
+    int window_update = data->set.http2_window_update ?
+      data->set.http2_window_update : 15663105;
+    rc = nghttp2_session_set_local_window_size(
+      ctx->h2, NGHTTP2_FLAG_NONE, 0, current_window + window_update);
+  }
   if(rc) {
     failf(data, "nghttp2_session_set_local_window_size() failed: %s(%d)",
           nghttp2_strerror(rc), rc);
     result = CURLE_HTTP2;
     goto out;
   }
+
+  /* curl-impersonate: retain the legacy Firefox stream-priority path. No
+   * current browser profile enables it, so it remains disabled by default.
+   *
+   * result = http2_set_stream_priorities(cf, data);
+   * if(result)
+   *   goto out;
+   *
+   * Firefox's first request stream followed its idle priority streams:
+   *
+   * #define FIREFOX_DEFAULT_STREAM_ID 15
+   * nghttp2_session_set_next_stream_id(ctx->h2,
+   *                                    FIREFOX_DEFAULT_STREAM_ID);
+   */
 
   /* all set, traffic will be send on connect */
   result = CURLE_OK;

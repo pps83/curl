@@ -187,6 +187,10 @@ typedef enum {
 /* Only use the custom method in the first request, always reset in the next */
 #define CURLFOLLOW_FIRSTONLY 3L
 
+/* curl-impersonate: Follow redirects, but reject redirects to
+   internal/private IP addresses (SSRF protection) */
+#define CURLFOLLOW_SAFE      4L
+
 struct curl_httppost {
   struct curl_httppost *next;       /* next entry in the list */
   char *name;                       /* pointer to allocated name */
@@ -1146,6 +1150,11 @@ typedef CURLSTScode (*curl_hstswrite_callback)(CURL *easy,
 
 /* 'long' argument with a set of values/bitmask */
 #define CURLOPTTYPE_VALUES      CURLOPTTYPE_LONG
+
+typedef long CURLhttp3sslpermute;
+#define CURL_HTTP3_SSL_PERMUTE_FALLBACK -1L
+#define CURL_HTTP3_SSL_PERMUTE_DISABLE   0L
+#define CURL_HTTP3_SSL_PERMUTE_ENABLE    1L
 
 /*
  * All CURLOPT_* values.
@@ -2288,6 +2297,167 @@ typedef enum {
   /* Space-separated list of components to sign for HTTP Message Signatures */
   CURLOPT(CURLOPT_HTTPSIG_HEADERS, CURLOPTTYPE_STRINGPOINT, 332),
 
+  /* curl-impersonate: The master option for setting an impersonate target.
+   * Impersonation target format is "name[:yes|no]".
+   * The optional suffix controls default browser headers. */
+  CURLOPT(CURLOPT_IMPERSONATE, CURLOPTTYPE_STRINGPOINT, 999),
+
+  /* curl-impersonate: A list of headers used by the impersonated browser.
+   * If given, merged with CURLOPT_HTTPHEADER. */
+  CURLOPT(CURLOPT_HTTPBASEHEADER, CURLOPTTYPE_SLISTPOINT, 1000),
+
+  /* curl-impersonate: A list of TLS signature hash algorithms.
+   * This has been implemented by curl as option 328, but we will keep it for compatibility.
+   * See https://datatracker.ietf.org/doc/html/rfc5246#section-7.4.1.4.1 */
+  CURLOPT(CURLOPT_SSL_SIG_HASH_ALGS, CURLOPTTYPE_STRINGPOINT, 1001),
+
+  /* curl-impersonate: Whether to enable ALPS in TLS or not.
+   * See https://datatracker.ietf.org/doc/html/draft-vvv-tls-alps.
+   * Support for ALPS is minimal and is intended only for the TLS client
+   * hello to match. */
+  CURLOPT(CURLOPT_SSL_ENABLE_ALPS, CURLOPTTYPE_LONG, 1002),
+
+  /* curl-impersonate: Comma-separated list of certificate compression
+   * algorithms to use. These are published in the client hello.
+   * Supported algorithms are "zlib" and "brotli".
+   * See https://datatracker.ietf.org/doc/html/rfc8879 */
+  CURLOPT(CURLOPT_SSL_CERT_COMPRESSION, CURLOPTTYPE_STRINGPOINT, 1003),
+
+  /* Enable/disable TLS session ticket extension (RFC5077) */
+  CURLOPT(CURLOPT_SSL_ENABLE_TICKET, CURLOPTTYPE_LONG, 1004),
+
+  /*
+   * curl-impersonate:
+   * Set the order of the HTTP/2 pseudo headers. The value must contain
+   * the letters 'm', 'a', 's', 'p' representing the pseudo-headers
+   * ":method", ":authority", ":scheme", ":path" in the desired order of
+   * appearance in the HTTP/2 HEADERS frame.
+   */
+  CURLOPT(CURLOPT_HTTP2_PSEUDO_HEADERS_ORDER, CURLOPTTYPE_STRINGPOINT, 1005),
+
+  /* curl-impersonate: HTTP2 settings frame keys and values, format: 1:v;2:v;3:v */
+  CURLOPT(CURLOPT_HTTP2_SETTINGS, CURLOPTTYPE_STRINGPOINT, 1006),
+
+  /*
+   * curl-impersonate: Whether to enable Boringssl permute extensions
+   * See https://commondatastorage.googleapis.com/chromium-boringssl-docs/ssl.h.html#SSL_set_permute_extensions.
+   */
+  CURLOPT(CURLOPT_SSL_PERMUTE_EXTENSIONS, CURLOPTTYPE_LONG, 1007),
+
+  /* curl-impersonate: HTTP2 initial window update */
+  CURLOPT(CURLOPT_HTTP2_WINDOW_UPDATE, CURLOPTTYPE_LONG, 1008),
+
+  /* curl-impersonate: Set the initial streams settings for http2. */
+  CURLOPT(CURLOPT_HTTP2_STREAMS, CURLOPTTYPE_STRINGPOINT, 1010),
+
+  /* curl-impersonate: enable tls grease */
+  CURLOPT(CURLOPT_TLS_GREASE, CURLOPTTYPE_LONG, 1011),
+
+  /* curl-impersonate: set tls extension order */
+  CURLOPT(CURLOPT_TLS_EXTENSION_ORDER, CURLOPTTYPE_STRINGPOINT, 1012),
+
+  /* curl-impersonate: Set stream exclusiveness, 0 or 1 */
+  CURLOPT(CURLOPT_STREAM_EXCLUSIVE, CURLOPTTYPE_LONG, 1013),
+
+  /* curl-impersonate: enable tls key usage check, defaults: on */
+  CURLOPT(CURLOPT_TLS_KEY_USAGE_NO_CHECK, CURLOPTTYPE_LONG, 1014),
+
+  /* curl-impersonate: enable tls signed cert stamps */
+  CURLOPT(CURLOPT_TLS_SIGNED_CERT_TIMESTAMPS, CURLOPTTYPE_LONG, 1015),
+
+  /* curl-impersonate: enable tls status request */
+  CURLOPT(CURLOPT_TLS_STATUS_REQUEST, CURLOPTTYPE_LONG, 1016),
+
+  /* curl-impersonate: firefox delegated credentials */
+  CURLOPT(CURLOPT_TLS_DELEGATED_CREDENTIALS, CURLOPTTYPE_STRINGPOINT, 1017),
+
+  /* curl-impersonate: firefox record size limit */
+  CURLOPT(CURLOPT_TLS_RECORD_SIZE_LIMIT, CURLOPTTYPE_LONG, 1018),
+
+  /* curl-impersonate: firefox key_shares_limit */
+  CURLOPT(CURLOPT_TLS_KEY_SHARES_LIMIT, CURLOPTTYPE_LONG, 1019),
+
+  /* curl-impersonate: Use the new ALPS code point */
+  CURLOPT(CURLOPT_TLS_USE_NEW_ALPS_CODEPOINT, CURLOPTTYPE_LONG, 1020),
+
+  /* curl-impersonate: Do not set the priority bit in http2 header frame */
+  CURLOPT(CURLOPT_HTTP2_NO_PRIORITY, CURLOPTTYPE_LONG, 1021),
+
+  /* curl-impersonate: Do not reuse TLS sessions or connections from different proxy credentials */
+  CURLOPT(CURLOPT_PROXY_CREDENTIAL_NO_REUSE, CURLOPTTYPE_LONG, 1022),
+
+  /* curl-impersonate: Split cookies into separate Cookie headers */
+  CURLOPT(CURLOPT_SPLIT_COOKIES, CURLOPTTYPE_LONG, 1023),
+
+  /* curl-impersonate: Set multipart/form-data boundary style */
+  CURLOPT(CURLOPT_FORM_BOUNDARY, CURLOPTTYPE_STRINGPOINT, 1024),
+
+  /*
+   * curl-impersonate:
+   * Set the order of the HTTP/3 pseudo headers. The value must contain
+   * the letters 'm', 'a', 's', 'p' representing the pseudo-headers
+   * ":method", ":authority", ":scheme", ":path" in the desired order of
+   * appearance in the HTTP/3 HEADERS frame.
+   *
+   * This is very similar to the http/2 option.
+   */
+  CURLOPT(CURLOPT_HTTP3_PSEUDO_HEADERS_ORDER, CURLOPTTYPE_STRINGPOINT, 1025),
+
+  /* curl-impersonate: HTTP3 settings frame keys and values, format: 1:v;6:v;7:v */
+  CURLOPT(CURLOPT_HTTP3_SETTINGS, CURLOPTTYPE_STRINGPOINT, 1026),
+
+  /* curl-impersonate: QUIC transport parameters, format: id:value;id:value */
+  CURLOPT(CURLOPT_QUIC_TRANSPORT_PARAMETERS, CURLOPTTYPE_STRINGPOINT, 1027),
+
+  /* curl-impersonate: Signature hash algorithms for HTTP/3 (QUIC TLS).
+   * If set, used instead of CURLOPT_SSL_SIGNATURE_ALGORITHMS for QUIC
+   * connections. */
+  CURLOPT(CURLOPT_HTTP3_SIG_HASH_ALGS, CURLOPTTYPE_STRINGPOINT, 1028),
+
+  /* curl-impersonate: TLS extension order for HTTP/3 (QUIC TLS).
+   * If set, used instead of CURLOPT_TLS_EXTENSION_ORDER for QUIC connections. */
+  CURLOPT(CURLOPT_HTTP3_TLS_EXTENSION_ORDER, CURLOPTTYPE_STRINGPOINT, 1029),
+
+  /* curl-impersonate: Comma-separated order for normal HTTP headers. */
+  CURLOPT(CURLOPT_HTTPHEADER_ORDER, CURLOPTTYPE_STRINGPOINT, 1030),
+
+  /* curl-impersonate: HTTP/3-specific custom HTTP headers.
+   * If set, used instead of CURLOPT_HTTPHEADER for HTTP/3 connections. */
+  CURLOPT(CURLOPT_HTTP3_HTTPHEADER, CURLOPTTYPE_SLISTPOINT, 1031),
+
+  /* curl-impersonate: HTTP/3-specific order for normal HTTP headers. */
+  CURLOPT(CURLOPT_HTTP3_HTTPHEADER_ORDER, CURLOPTTYPE_STRINGPOINT, 1032),
+
+  /* curl-impersonate: HTTP/3-specific EC curves. */
+  CURLOPT(CURLOPT_HTTP3_SSL_EC_CURVES, CURLOPTTYPE_STRINGPOINT, 1033),
+
+  /* curl-impersonate: WebSocket-specific custom HTTP headers.
+   * If set, used instead of CURLOPT_HTTPHEADER for ws:// and wss://. */
+  CURLOPT(CURLOPT_WS_HTTPHEADER, CURLOPTTYPE_SLISTPOINT, 1034),
+
+  /* curl-impersonate: WebSocket-specific order for normal HTTP headers. */
+  CURLOPT(CURLOPT_WS_HTTPHEADER_ORDER, CURLOPTTYPE_STRINGPOINT, 1035),
+
+  /* curl-impersonate: Disable WebSocket TLS session ticket extension. */
+  CURLOPT(CURLOPT_WS_SSL_DISABLE_TICKET, CURLOPTTYPE_LONG, 1036),
+
+  /* curl-impersonate: WebSocket-specific TLS certificate compression. */
+  CURLOPT(CURLOPT_WS_SSL_CERT_COMPRESSION, CURLOPTTYPE_STRINGPOINT, 1037),
+
+  /* curl-impersonate: QUIC initial connection ID length profile. */
+  CURLOPT(CURLOPT_QUIC_CID_LENGTH, CURLOPTTYPE_STRINGPOINT, 1038),
+
+  /* curl-impersonate: HTTP/3-specific BoringSSL extension permutation.
+   * -1 inherits CURLOPT_SSL_PERMUTE_EXTENSIONS, 0 disables, 1 enables. */
+  CURLOPT(CURLOPT_HTTP3_SSL_PERMUTE_EXTENSIONS, CURLOPTTYPE_LONG, 1039),
+
+  /* curl-impersonate: Comma-separated TLS trust anchor relative OIDs. */
+  CURLOPT(CURLOPT_TLS_TRUST_ANCHORS, CURLOPTTYPE_STRINGPOINT, 1040),
+
+  /* curl-impersonate: QUIC initial packet number. -1 selects the Firefox
+   * randomized distribution; non-negative values select a fixed number. */
+  CURLOPT(CURLOPT_QUIC_INITIAL_PACKET_NUMBER, CURLOPTTYPE_LONG, 1041),
+
   CURLOPT_LASTENTRY /* the last unused */
 } CURLoption;
 
@@ -3022,7 +3192,14 @@ typedef enum {
   CURLINFO_HTTPAUTH_USED    = CURLINFO_LONG + 69,
   CURLINFO_PROXYAUTH_USED   = CURLINFO_LONG + 70,
   CURLINFO_SIZE_DELIVERED   = CURLINFO_OFF_T + 71,
-  CURLINFO_LASTONE          = 71
+  /* curl-impersonate: accepted server cookie mutations from the latest
+   * transfer, formatted as SET/DELETE plus Netscape cookie fields. Use a
+   * high number to avoid collisions with upstream infos. */
+  CURLINFO_COOKIECHANGES    = CURLINFO_SLIST + 1000,
+  /* curl-impersonate: followed HTTP redirect responses from the latest
+   * transfer, formatted as status-code plus tab plus request URL. */
+  CURLINFO_REDIRECT_HISTORY = CURLINFO_SLIST + 1001,
+  CURLINFO_LASTONE          = 1001
 } CURLINFO;
 
 /* CURLINFO_RESPONSE_CODE is the new name for the option previously known as

@@ -98,7 +98,7 @@ static CURLcode cf_setup_add_socks(struct Curl_cfilter *cf,
       return CURLE_FAILED_INIT;
 
     result = Curl_cf_socks_proxy_insert_after(
-      cf, data, second_peer, cf->conn->ip_version,
+      cf, data, second_peer, ctx->transport, cf->conn->ip_version,
       cf->conn->socks_proxy.proxytype,
       cf->conn->socks_proxy.creds);
     if(result) {
@@ -190,6 +190,15 @@ static CURLcode cf_setup_add_ip_happy(struct Curl_cfilter *cf,
     if(!first_peer)
       return CURLE_FAILED_INIT;
 
+#ifndef CURL_DISABLE_PROXY
+    /* curl-impersonate: QUIC over SOCKS first establishes the TCP control
+     * channel. The SOCKS filter later switches the data path to its UDP
+     * relay. */
+    if((ctx->transport == TRNSPRT_QUIC) &&
+       cf->conn->socks_proxy.peer && !cf->conn->http_proxy.peer)
+      first_transport = TRNSPRT_TCP;
+#endif
+
 #if !defined(CURL_DISABLE_PROXY) && !defined(CURL_DISABLE_HTTP)
     if(cf->conn->http_proxy.peer && !cf->conn->bits.origin_is_proxy) {
       first_transport =
@@ -257,6 +266,21 @@ static CURLcode cf_setup_add_origin_filters(struct Curl_cfilter *cf,
         return result;
       }
       CURL_TRC_CF(data, cf, "added QUIC filter for origin");
+    }
+    else if(ctx->transport == TRNSPRT_QUIC &&
+            cf->conn->socks_proxy.peer) {
+      struct Curl_peer *origin =
+        Curl_conn_get_origin(cf->conn, cf->sockindex);
+      struct Curl_peer *peer =
+        Curl_conn_get_destination(cf->conn, cf->sockindex);
+
+      result = Curl_cf_quic_insert_after(cf, data, origin, peer);
+      if(result) {
+        CURL_TRC_CF(data, cf, "adding QUIC over SOCKS failed -> %d",
+                    (int)result);
+        return result;
+      }
+      CURL_TRC_CF(data, cf, "added QUIC over SOCKS filter for origin");
     }
     else
 #endif /* !CURL_DISABLE_HTTP && USE_HTTP3 && CURL_DISABLE_PROXY */

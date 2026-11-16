@@ -53,6 +53,9 @@
 #include "curlx/win32-fopen.h"
 #include "connect.h"
 #include "cfilters.h"
+#include "cf-socket.h"
+#include "sockaddr.h"
+#include "socks.h"
 #include "vdns/cf-dns.h"
 #include "vquic/cf-ngtcp2.h"
 #include "vquic/cf-ngtcp2-cmn.h"
@@ -64,6 +67,38 @@
 #include "vquic/vquic_int.h"
 #include "curlx/strerr.h"
 #include "curlx/strparse.h"
+
+static CURLcode vquic_peek_socket(struct Curl_cfilter *cf,
+                                  struct Curl_easy *data,
+                                  struct ip_quadruple *pip)
+{
+  for(; cf; cf = cf->next) {
+    if(!Curl_cf_socket_peek(cf, data, NULL, NULL, pip))
+      return CURLE_OK;
+  }
+  return CURLE_FAILED_INIT;
+}
+
+/* Resolve the relay address from the active socket for recv callbacks. */
+static bool vquic_get_remote_addr(struct Curl_cfilter *cf,
+                                  struct Curl_easy *data,
+                                  struct sockaddr_storage *remote_addr,
+                                  socklen_t *remote_addrlen)
+{
+  const struct Curl_sockaddr_ex *peer_addr = NULL;
+  int dummy = 0;
+
+  for(; cf; cf = cf->next) {
+    if(!cf->cft->query(cf, data, CF_QUERY_REMOTE_ADDR, &dummy,
+                       &peer_addr) && peer_addr) {
+      memset(remote_addr, 0, sizeof(*remote_addr));
+      memcpy(remote_addr, &peer_addr->curl_sa_addr, peer_addr->addrlen);
+      *remote_addrlen = (socklen_t)peer_addr->addrlen;
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
 
 
 #define NW_CHUNK_SIZE     (64 * 1024)
@@ -443,6 +478,38 @@ static CURLcode vquic_send_packets(struct Curl_cfilter *cf,
                                    size_t gsolen, size_t *psent)
 {
   CURLcode result;
+
+  if(Curl_cf_socks_proxy_is_udp_associate(cf->next)) {
+    size_t sent_total = 0;
+    const uint8_t *p = pkt;
+    size_t pktstep = gsolen ? gsolen : pktlen;
+
+    /* SOCKS UDP ASSOCIATE needs per-packet encapsulation in the filter. */
+    infof(data, "QUIC over SOCKS UDP send: bytes=%zu gso=%zu",
+          pktlen, gsolen);
+    qctx->no_gso = TRUE;
+    while(sent_total < pktlen) {
+      size_t len = CURLMIN(pktstep, pktlen - sent_total);
+      size_t nwritten = 0;
+
+      result = Curl_conn_cf_send(cf->next, data, p, len, FALSE, &nwritten);
+      if(result) {
+        if(result == CURLE_AGAIN) {
+          *psent = sent_total;
+          return result;
+        }
+        return result;
+      }
+      if(nwritten != len)
+        return CURLE_SEND_ERROR;
+      sent_total += nwritten;
+      p += nwritten;
+    }
+    *psent = sent_total;
+    qctx->last_io = qctx->last_op;
+    return CURLE_OK;
+  }
+
 #ifdef DEBUGBUILD
   /* simulate network blocking/partial writes */
   if(qctx->wblock_percent > 0) {
@@ -692,7 +759,7 @@ static CURLcode recvmmsg_packets(struct Curl_cfilter *cf,
       }
       if(!cf->connected && SOCKERRNO == SOCKECONNREFUSED) {
         struct ip_quadruple ip;
-        if(!Curl_cf_socket_peek(cf->next, data, NULL, NULL, &ip))
+        if(!vquic_peek_socket(cf->next, data, &ip))
           failf(data, "QUIC: connection to %s port %u refused",
                 ip.remote_ip, ip.remote_port);
         result = CURLE_COULDNT_CONNECT;
@@ -894,7 +961,7 @@ static CURLcode recvmsg_packets(struct Curl_cfilter *cf,
       }
       if(!cf->connected && SOCKERRNO == SOCKECONNREFUSED) {
         struct ip_quadruple ip;
-        if(!Curl_cf_socket_peek(cf->next, data, NULL, NULL, &ip))
+        if(!vquic_peek_socket(cf->next, data, &ip))
           failf(data, "QUIC: connection to %s port %u refused",
                 ip.remote_ip, ip.remote_port);
         result = CURLE_COULDNT_CONNECT;
@@ -968,7 +1035,7 @@ static CURLcode recvfrom_packets(struct Curl_cfilter *cf,
       }
       if(!cf->connected && SOCKERRNO == SOCKECONNREFUSED) {
         struct ip_quadruple ip;
-        if(!Curl_cf_socket_peek(cf->next, data, NULL, NULL, &ip))
+        if(!vquic_peek_socket(cf->next, data, &ip))
           failf(data, "QUIC: connection to %s port %u refused",
                 ip.remote_ip, ip.remote_port);
         result = CURLE_COULDNT_CONNECT;
@@ -1013,7 +1080,56 @@ CURLcode Curl_vquic_recv_packets(struct Curl_cfilter *cf,
 {
   CURLcode result;
   size_t nread = 0;
-#ifdef HAVE_SENDMMSG
+
+  if(Curl_cf_socks_proxy_is_udp_associate(cf->next)) {
+    uint8_t buf[NW_CHUNK_SIZE];
+    struct sockaddr_storage remote_addr;
+    socklen_t remote_addrlen = 0;
+    size_t total_nread = 0;
+    size_t pkts = 0;
+
+    result = CURLE_OK;
+    /* SOCKS UDP ASSOCIATE recv path goes through the filter chain. */
+    infof(data, "QUIC over SOCKS UDP recv: max_pkts=%zu", max_pkts);
+    for(pkts = 0, total_nread = 0; pkts < max_pkts;) {
+      size_t pktlen = 0;
+      result = Curl_conn_cf_recv(cf->next, data, (char *)buf, sizeof(buf),
+                                 &pktlen);
+      if(result) {
+        if(result == CURLE_AGAIN) {
+          result = CURLE_OK;
+          break;
+        }
+        if(!cf->connected && data->state.os_errno == SOCKECONNREFUSED) {
+          struct ip_quadruple ip;
+          if(!vquic_peek_socket(cf->next, data, &ip))
+            failf(data, "QUIC: connection to %s port %u refused",
+                  ip.remote_ip, ip.remote_port);
+          return CURLE_COULDNT_CONNECT;
+        }
+        return result;
+      }
+
+      if(!vquic_get_remote_addr(cf->next, data, &remote_addr,
+                                &remote_addrlen))
+        return CURLE_FAILED_INIT;
+      if(!pktlen)
+        continue;
+      ++pkts;
+      total_nread += pktlen;
+      result = recv_cb(buf, pktlen, pktlen, &remote_addr,
+                       remote_addrlen, 0, userp);
+      if(result)
+        return result;
+    }
+
+    nread = total_nread;
+    if(total_nread || result)
+      CURL_TRC_CF(data, cf, "recvd %zu packets with %zu bytes -> %d",
+                  pkts, total_nread, result);
+  }
+  else
+#if defined(HAVE_SENDMMSG)
   result = recvmmsg_packets(cf, data, qctx, max_pkts, recv_cb, userp, &nread);
 #elif defined(HAVE_APPLE_MSG_X)
   result = recvmsg_x_packets(cf, data, qctx, max_pkts, recv_cb, userp,
@@ -1213,14 +1329,7 @@ CURLcode Curl_conn_may_http3(struct Curl_easy *data,
     failf(data, "HTTP/3 requested for non-HTTPS URL");
     return CURLE_URL_MALFORMAT;
   }
-#ifndef CURL_DISABLE_PROXY
-  if(conn->socks_proxy.peer) {
-    failf(data, "HTTP/3 is not supported over a SOCKS proxy");
-    return CURLE_URL_MALFORMAT;
-  }
-#else
   (void)conn;
-#endif
 
   return CURLE_OK;
 }

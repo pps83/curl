@@ -227,10 +227,16 @@ static CURLcode ssl_peer_key_add_vrfy(struct dynbuf *buf,
 
 static CURLcode ssl_peer_key_build(struct ssl_filter_config *ssl,
                                    const struct ssl_peer *peer,
+                                   const struct connectdata *conn,
                                    const char *tls_id,
                                    char **ppeer_key)
 {
   struct dynbuf buf;
+  const char *curves = Curl_ssl_config_get_curves(ssl, peer->transport);
+  const char *signature_algorithms =
+    Curl_ssl_config_get_signature_algorithms(ssl, peer->transport);
+  const char *tls_extension_order =
+    Curl_ssl_config_get_tls_extension_order(ssl, peer->transport);
   size_t key_len;
   bool is_local = FALSE;
   CURLcode result;
@@ -259,6 +265,22 @@ static CURLcode ssl_peer_key_build(struct ssl_filter_config *ssl,
     if(result)
       goto out;
   }
+  if(!ssl->enable_ticket) {
+    result = curlx_dyn_add(&buf, ":NOTICKET");
+    if(result)
+      goto out;
+  }
+  if(ssl->trust_anchors) {
+    result = curlx_dyn_addf(&buf, ":TRUSTANCHORS-%s", ssl->trust_anchors);
+    if(result)
+      goto out;
+  }
+  if((peer->transport == TRNSPRT_QUIC) &&
+     ssl->http3_ssl_permute_extensions) {
+    result = curlx_dyn_add(&buf, ":H3PERMUTE");
+    if(result)
+      goto out;
+  }
   if(ssl->cipher_list) {
     result = curlx_dyn_addf(&buf, ":CIPHER-%s", ssl->cipher_list);
     if(result)
@@ -269,17 +291,65 @@ static CURLcode ssl_peer_key_build(struct ssl_filter_config *ssl,
     if(result)
       goto out;
   }
-  if(ssl->curves) {
-    result = curlx_dyn_addf(&buf, ":CURVES-%s", ssl->curves);
+  if(curves) {
+    result = curlx_dyn_addf(&buf, ":CURVES-%s", curves);
     if(result)
       goto out;
   }
-  if(ssl->signature_algorithms) {
-    result = curlx_dyn_addf(&buf, ":SIGALGS-%s",
-                            ssl->signature_algorithms);
+  if(signature_algorithms) {
+    result = curlx_dyn_addf(&buf, ":SIGALGS-%s", signature_algorithms);
     if(result)
       goto out;
   }
+  if(tls_extension_order) {
+    result = curlx_dyn_addf(&buf, ":EXTORDER-%s", tls_extension_order);
+    if(result)
+      goto out;
+  }
+  if(ssl->cert_compression) {
+    result = curlx_dyn_addf(&buf, ":CERTCOMP-%s", ssl->cert_compression);
+    if(result)
+      goto out;
+  }
+#ifndef CURL_DISABLE_PROXY
+  /* Keep sessions started through one proxy from being resumed through a
+   * different proxy when credential reuse is disabled. */
+  if(conn && conn->bits.proxy_credential_no_reuse) {
+    const struct proxy_info *proxy = NULL;
+    const char *proxy_type = NULL;
+
+    if(conn->http_proxy.peer) {
+      proxy = &conn->http_proxy;
+      proxy_type = "HTTP";
+    }
+    else if(conn->socks_proxy.peer) {
+      proxy = &conn->socks_proxy;
+      proxy_type = "SOCKS";
+    }
+
+    if(proxy) {
+      result = curlx_dyn_addf(&buf, ":PTYPE-%s:PHOST-%s:PPORT-%u",
+                              proxy_type, proxy->peer->hostname,
+                              proxy->peer->port);
+      if(result)
+        goto out;
+      if(Curl_creds_has_user(proxy->creds)) {
+        result = curlx_dyn_addf(&buf, ":PUSER-%s", proxy->creds->user);
+        if(result)
+          goto out;
+      }
+      if(Curl_creds_has_passwd(proxy->creds)) {
+        /* Do not put the password in the key, but distinguish authenticated
+         * proxies from proxies without a password. */
+        result = curlx_dyn_add(&buf, ":PPW");
+        if(result)
+          goto out;
+      }
+    }
+  }
+#else
+  (void)conn;
+#endif
   if(ssl->verifypeer) {
     result = cf_ssl_peer_key_add_path(&buf, "CA", ssl->CAfile, &is_local);
     if(result)
@@ -348,7 +418,16 @@ CURLcode Curl_ssl_peer_key_make(const struct ssl_peer *peer,
                                 const char *tls_id,
                                 char **ppeer_key)
 {
-  return ssl_peer_key_build(sslc, peer, tls_id, ppeer_key);
+  return ssl_peer_key_build(sslc, peer, NULL, tls_id, ppeer_key);
+}
+
+CURLcode Curl_ssl_peer_key_make_conn(const struct ssl_peer *peer,
+                                     struct ssl_filter_config *sslc,
+                                     const struct connectdata *conn,
+                                     const char *tls_id,
+                                     char **ppeer_key)
+{
+  return ssl_peer_key_build(sslc, peer, conn, tls_id, ppeer_key);
 }
 
 struct Curl_ssl_scache {

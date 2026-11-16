@@ -44,6 +44,9 @@
 /* number of seconds in 400 days */
 #define COOKIES_MAXAGE (400 * 24 * 3600)
 
+static CURLcode record_cookie_change(struct Curl_easy *data,
+                                     const struct Cookie *co);
+
 /* Make sure cookies never expire further away in time than 400 days into the
    future. (from RFC6265bis draft-19)
 
@@ -1080,6 +1083,12 @@ CURLcode Curl_cookie_add(struct Curl_easy *data,
   if(co->expires && (co->expires < ci->next_expiration))
     ci->next_expiration = co->expires;
 
+  if(flags & COOKIE_RECORD) {
+    result = record_cookie_change(data, co);
+    if(result)
+      return result;
+  }
+
   if(flags & COOKIE_HTTPHEADER)
     data->req.setcookies++;
 
@@ -1505,6 +1514,39 @@ static char *get_netscape_format(const struct Cookie *co)
     co->expires,
     co->name,
     co->value ? co->value : "");
+}
+
+/* Record a normalized, accepted server cookie mutation for getinfo. */
+static CURLcode record_cookie_change(struct Curl_easy *data,
+                                     const struct Cookie *co)
+{
+  struct curl_slist *list;
+  const char *action = (co->expires &&
+                        co->expires < (curl_off_t)time(NULL)) ?
+    "DELETE" : "SET";
+  char *cookie = get_netscape_format(co);
+  char *change;
+
+  if(!cookie)
+    return CURLE_OUT_OF_MEMORY;
+
+  change = curl_maprintf("%s\t%s", action, cookie);
+  curlx_free(cookie);
+  if(!change)
+    return CURLE_OUT_OF_MEMORY;
+
+  list = Curl_slist_append_nodup(NULL, change);
+  if(!list) {
+    curlx_free(change);
+    return CURLE_OUT_OF_MEMORY;
+  }
+
+  if(data->info.cookiechanges_tail)
+    data->info.cookiechanges_tail->next = list;
+  else
+    data->info.cookiechanges = list;
+  data->info.cookiechanges_tail = list;
+  return CURLE_OK;
 }
 
 /*

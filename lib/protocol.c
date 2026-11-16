@@ -431,7 +431,7 @@ const struct Curl_scheme Curl_scheme_wss = {
   CURLPROTO_WSS,                        /* protocol */
   CURLPROTO_HTTP,                       /* family */
   PROTOPT_SSL | PROTOPT_CREDSPERREQUEST | /* flags */
-  PROTOPT_USERPWDCTRL | PROTOPT_HTTP_PROXY_TUNNEL,
+  PROTOPT_USERPWDCTRL | PROTOPT_HTTP_PROXY_TUNNEL | PROTOPT_ALPN,
   PORT_HTTPS                            /* defport */
 };
 

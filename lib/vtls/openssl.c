@@ -37,6 +37,7 @@
 #include "vtls/openssl.h"
 #include "connect.h"
 #include "progress.h"
+#include "rand.h"
 #include "vtls/vtls.h"
 #include "vtls/vtls_int.h"
 #include "vtls/vtls_scache.h"
@@ -52,6 +53,10 @@
 #include "vdns/cf-dns.h"
 #include "vdns/httpsrr.h"
 #include "vtls/apple.h"
+#if defined(USE_WIN32_CRYPTO) && defined(OPENSSL_IS_BORINGSSL)
+#include <wininet.h>
+#define USE_WIN32_NATIVE_VERIFY
+#endif
 #ifdef USE_ECH
 #include "curlx/base64.h"
 #endif
@@ -68,8 +73,24 @@
 #include <openssl/rsa.h>
 #include <openssl/bio.h>
 #include <openssl/pkcs12.h>
+#ifdef OPENSSL_IS_BORINGSSL
+#include <openssl/bytestring.h>
+#include <openssl/pool.h>
+#endif
 #include <openssl/tls1.h>
 #include <openssl/evp.h>
+
+#ifdef OPENSSL_IS_BORINGSSL
+#ifdef HAVE_LIBZ
+#include <zlib.h>
+#endif
+#ifdef HAVE_BROTLI
+#include <brotli/decode.h>
+#endif
+#ifdef HAVE_ZSTD
+#include <zstd.h>
+#endif
+#endif
 
 #if defined(HAVE_SSL_SET1_ECH_CONFIG_LIST) && !defined(HAVE_BORINGSSL_LIKE)
 #include <openssl/ech.h>
@@ -165,6 +186,117 @@
 
 #ifdef HAVE_BORINGSSL_LIKE
 typedef size_t numcert_t;
+
+#if defined(OPENSSL_IS_BORINGSSL)
+#define HAVE_SSL_CTX_SET_VERIFY_ALGORITHM_PREFS
+
+/*
+ * kMaxSignatureAlgorithmNameLen and kSignatureAlgorithmNames
+ * Taken from BoringSSL, see ssl/ssl_privkey.cc
+ * */
+static const size_t kMaxSignatureAlgorithmNameLen = 23;
+
+static const struct {
+  uint16_t signature_algorithm;
+  const char *name;
+} kSignatureAlgorithmNames[] = {
+    {SSL_SIGN_RSA_PKCS1_MD5_SHA1, "rsa_pkcs1_md5_sha1"},
+    {SSL_SIGN_RSA_PKCS1_SHA1, "rsa_pkcs1_sha1"},
+    {SSL_SIGN_RSA_PKCS1_SHA256, "rsa_pkcs1_sha256"},
+    {SSL_SIGN_RSA_PKCS1_SHA384, "rsa_pkcs1_sha384"},
+    {SSL_SIGN_RSA_PKCS1_SHA512, "rsa_pkcs1_sha512"},
+    {SSL_SIGN_ECDSA_SHA1, "ecdsa_sha1"},
+    {SSL_SIGN_ECDSA_SECP256R1_SHA256, "ecdsa_secp256r1_sha256"},
+    {SSL_SIGN_ECDSA_SECP384R1_SHA384, "ecdsa_secp384r1_sha384"},
+    {SSL_SIGN_ECDSA_SECP521R1_SHA512, "ecdsa_secp521r1_sha512"},
+    {SSL_SIGN_RSA_PSS_RSAE_SHA256, "rsa_pss_rsae_sha256"},
+    {SSL_SIGN_RSA_PSS_RSAE_SHA384, "rsa_pss_rsae_sha384"},
+    {SSL_SIGN_RSA_PSS_RSAE_SHA512, "rsa_pss_rsae_sha512"},
+    {SSL_SIGN_ED25519, "ed25519"},
+    {SSL_SIGN_ML_DSA_44, "mldsa44"},
+    {SSL_SIGN_ML_DSA_65, "mldsa65"},
+    {SSL_SIGN_ML_DSA_87, "mldsa87"},
+};
+
+#define MAX_SIG_ALGS \
+  sizeof(kSignatureAlgorithmNames) / sizeof(kSignatureAlgorithmNames[0])
+
+/* Default signature hash algorithms taken from Chrome/Chromium.
+ * See kVerifyPeers @ net/socket/ssl_client_socket_impl.cc */
+static const uint16_t default_sig_algs[] = {
+  SSL_SIGN_ECDSA_SECP256R1_SHA256, SSL_SIGN_RSA_PSS_RSAE_SHA256,
+  SSL_SIGN_RSA_PKCS1_SHA256,       SSL_SIGN_ECDSA_SECP384R1_SHA384,
+  SSL_SIGN_RSA_PSS_RSAE_SHA384,    SSL_SIGN_RSA_PKCS1_SHA384,
+  SSL_SIGN_RSA_PSS_RSAE_SHA512,    SSL_SIGN_RSA_PKCS1_SHA512,
+};
+
+#define DEFAULT_SIG_ALGS_LENGTH  \
+  sizeof(default_sig_algs) / sizeof(default_sig_algs[0])
+
+static CURLcode parse_sig_algs(struct Curl_easy *data,
+                               const char *sigalgs,
+                               uint16_t *algs,
+                               size_t *nalgs)
+{
+  *nalgs = 0;
+  while(sigalgs && sigalgs[0]) {
+    int i;
+    bool found = FALSE;
+    const char *end;
+    size_t len;
+    char algname[kMaxSignatureAlgorithmNameLen + 1];
+
+    end = strpbrk(sigalgs, ":,");
+    if(end)
+      len = end - sigalgs;
+    else
+      len = strlen(sigalgs);
+
+    if(len > kMaxSignatureAlgorithmNameLen) {
+      failf(data, "Bad signature hash algorithm list");
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    }
+
+    if(!len) {
+      ++sigalgs;
+      continue;
+    }
+
+    if(*nalgs == MAX_SIG_ALGS) {
+      /* Reached the maximum number of possible algorithms, but more data
+       * available in the list. */
+      failf(data, "Bad signature hash algorithm list");
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    }
+
+    memcpy(algname, sigalgs, len);
+    algname[len] = 0;
+
+    for(i = 0; i < MAX_SIG_ALGS; i++) {
+      if(curl_strequal(algname, kSignatureAlgorithmNames[i].name)) {
+        algs[*nalgs] = kSignatureAlgorithmNames[i].signature_algorithm;
+        (*nalgs)++;
+        found = TRUE;
+        break;
+      }
+    }
+
+    if(!found) {
+      failf(data, "Unknown signature hash algorithm: '%s'", algname);
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    }
+
+    if(end)
+      sigalgs = ++end;
+    else
+      break;
+  }
+
+  return CURLE_OK;
+}
+
+#endif
+
 typedef uint32_t sslerr_t;
 #else
 typedef int numcert_t;
@@ -2443,6 +2575,191 @@ static const char *tls_rt_type(int type)
   }
 }
 
+#ifdef OPENSSL_IS_BORINGSSL
+
+#ifdef HAVE_LIBZ
+int DecompressZlibCert(SSL *ssl,
+                       CRYPTO_BUFFER** out,
+                       size_t uncompressed_len,
+                       const uint8_t* in,
+                       size_t in_len)
+{
+  z_stream strm;
+  uint8_t* data;
+  CRYPTO_BUFFER* decompressed = CRYPTO_BUFFER_alloc(&data, uncompressed_len);
+  if(!decompressed) {
+    return 0;
+  }
+
+  strm.zalloc = NULL;
+  strm.zfree = NULL;
+  strm.opaque = NULL;
+  strm.next_in = (Bytef *)in;
+  strm.avail_in = in_len;
+  strm.next_out = (Bytef *)data;
+  strm.avail_out = uncompressed_len;
+
+  if(inflateInit(&strm) != Z_OK) {
+    CRYPTO_BUFFER_free(decompressed);
+    return 0;
+  }
+
+  if(inflate(&strm, Z_FINISH) != Z_STREAM_END ||
+    strm.avail_in != 0 ||
+    strm.avail_out != 0) {
+    inflateEnd(&strm);
+    CRYPTO_BUFFER_free(decompressed);
+    return 0;
+  }
+
+  inflateEnd(&strm);
+  *out = decompressed;
+  return 1;
+}
+#endif
+
+#ifdef HAVE_BROTLI
+
+/* Taken from Chromium and adapted to C,
+ * see net/ssl/cert_compression.cc
+ */
+int DecompressBrotliCert(SSL* ssl,
+                         CRYPTO_BUFFER** out,
+                         size_t uncompressed_len,
+                         const uint8_t* in,
+                         size_t in_len) {
+  uint8_t* data;
+  CRYPTO_BUFFER* decompressed = CRYPTO_BUFFER_alloc(&data, uncompressed_len);
+  if (!decompressed) {
+    return 0;
+  }
+
+  size_t output_size = uncompressed_len;
+  if (BrotliDecoderDecompress(in_len, in, &output_size, data) !=
+          BROTLI_DECODER_RESULT_SUCCESS ||
+      output_size != uncompressed_len) {
+    CRYPTO_BUFFER_free(decompressed);
+    return 0;
+  }
+
+  *out = decompressed;
+  return 1;
+}
+#endif
+
+/* curl-impersonate: decompress the zstd cert */
+#ifdef HAVE_ZSTD
+int DecompressZstdCert(SSL* ssl,
+                       CRYPTO_BUFFER** out,
+                       size_t uncompressed_len,
+                       const uint8_t* in,
+                       size_t in_len) {
+  size_t result;
+  uint8_t* data;
+  CRYPTO_BUFFER* decompressed = CRYPTO_BUFFER_alloc(&data, uncompressed_len);
+  if (!decompressed) {
+    return 0;
+  }
+
+  /* zstd returns the size of decompressed content */
+  result = ZSTD_decompress(data, uncompressed_len, in, in_len);
+  if (ZSTD_isError(result)) {
+    CRYPTO_BUFFER_free(decompressed);
+    return 0;
+  }
+
+  *out = decompressed;
+  return 1;
+}
+
+#endif
+
+
+#if defined(HAVE_LIBZ) || defined(HAVE_BROTLI) || defined(HAVE_ZSTD)
+static struct {
+  char *alg_name;
+  uint16_t alg_id;
+  ssl_cert_compression_func_t compress;
+  ssl_cert_decompression_func_t decompress;
+} cert_compress_algs[] = {
+#ifdef HAVE_LIBZ
+  {"zlib", TLSEXT_cert_compression_zlib, NULL, DecompressZlibCert},
+#endif
+#ifdef HAVE_BROTLI
+  {"brotli", TLSEXT_cert_compression_brotli, NULL, DecompressBrotliCert},
+#endif
+#ifdef HAVE_ZSTD
+  {"zstd", TLSEXT_cert_compression_zstd, NULL, DecompressZstdCert},
+#endif
+};
+
+#define NUM_CERT_COMPRESSION_ALGS \
+  sizeof(cert_compress_algs) / sizeof(cert_compress_algs[0])
+
+/*
+ * curl-impersonate:
+ * Add support for TLS extension 27 - compress_certificate.
+ * This calls the BoringSSL-specific API SSL_CTX_add_cert_compression_alg
+ * for each algorithm specified in cert_compression, which is a comma separated list.
+ */
+static CURLcode add_cert_compression(struct Curl_easy *data,
+                                     SSL_CTX *ctx,
+                                     const char *algorithms)
+{
+  int i;
+  const char *s = algorithms;
+  char *alg_name;
+  size_t alg_name_len;
+  bool found;
+
+  while (s && s[0]) {
+    found = FALSE;
+
+    for(i = 0; i < NUM_CERT_COMPRESSION_ALGS; i++) {
+      alg_name = cert_compress_algs[i].alg_name;
+      alg_name_len = strlen(alg_name);
+      if(strlen(s) >= alg_name_len &&
+         curl_strnequal(s, alg_name, alg_name_len) &&
+         (s[alg_name_len] == ',' || s[alg_name_len] == 0)) {
+        if(!SSL_CTX_add_cert_compression_alg(ctx,
+                    cert_compress_algs[i].alg_id,
+                    cert_compress_algs[i].compress,
+                    cert_compress_algs[i].decompress)) {
+          failf(data, "Error adding certificate compression algorithm '%s'",
+                alg_name);
+          return CURLE_SSL_CIPHER;
+        }
+        s += alg_name_len;
+        if(*s == ',')
+          s += 1;
+        found = TRUE;
+        break;
+      }
+    }
+
+    if(!found) {
+      failf(data, "Invalid compression algorithm list");
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    }
+  }
+
+  return CURLE_OK;
+}
+#else
+static CURLcode add_cert_compression(struct Curl_easy *data,
+                                     SSL_CTX *ctx,
+                                     const char *algorithms)
+{
+  /* No compression algorithms are available. */
+  (void)data;
+  (void)ctx;
+  (void)algorithms;
+  return CURLE_BAD_FUNCTION_ARGUMENT;
+}
+#endif
+
+#endif /* OPENSSL_IS_BORINGSSL */
+
 /*
  * Our callback from the SSL/TLS layers.
  */
@@ -2981,6 +3298,194 @@ static CURLcode ossl_windows_load_anchors(struct Curl_cfilter *cf,
   return result;
 }
 
+#ifdef USE_WIN32_NATIVE_VERIFY
+
+static bool ossl_win_add_cert(HCERTSTORE store, X509 *cert,
+                              PCCERT_CONTEXT *context)
+{
+  unsigned char *der = NULL;
+  int len = i2d_X509(cert, &der);
+  BOOL added = FALSE;
+
+  if(len > 0)
+    added = CertAddEncodedCertificateToStore(store, X509_ASN_ENCODING,
+                                              der, (DWORD)len,
+                                              CERT_STORE_ADD_USE_EXISTING,
+                                              context);
+  else
+    SetLastError(ERROR_INVALID_DATA);
+  OPENSSL_free(der);
+  return added != FALSE;
+}
+
+/* Keep BoringSSL for the handshake, but use Windows chain policy, including
+ * the Disallowed CTL. An explicit CA may extend trust, never override a
+ * Windows distrust or other certificate policy failure. */
+static int ossl_win_verify(X509_STORE_CTX *store_ctx, void *arg)
+{
+  struct ossl_ctx *octx = arg;
+  struct Curl_cfilter *cf = octx->cf;
+  /* TCP TLS and QUIC have different filter context layouts. */
+  struct Curl_easy *data = octx->call_data->data;
+  struct ssl_filter_config *config = Curl_ssl_cf_get_filter_config(cf);
+  SSL *ssl = X509_STORE_CTX_get_ex_data(store_ctx,
+                                       SSL_get_ex_data_X509_STORE_CTX_idx());
+  X509 *leaf = X509_STORE_CTX_get0_cert(store_ctx);
+  STACK_OF(X509) *certs = X509_STORE_CTX_get0_untrusted(store_ctx);
+  HCERTSTORE store = NULL;
+  PCCERT_CONTEXT server = NULL;
+  PCCERT_CONTEXT anchor = NULL;
+  PCCERT_CHAIN_CONTEXT chain = NULL;
+  CERT_CHAIN_PARA chain_para;
+  CERT_CHAIN_POLICY_PARA policy_para;
+  CERT_CHAIN_POLICY_STATUS policy_status;
+  SSL_EXTRA_CERT_CHAIN_POLICY_PARA ssl_para;
+  LPSTR usage = CURL_UNCONST(szOID_PKIX_KP_SERVER_AUTH);
+  DWORD error = 0;
+  int verify_error = X509_V_ERR_APPLICATION_VERIFICATION;
+  int explicit_trust;
+  bool have_anchor = FALSE;
+  size_t i;
+  const char *ech_name = NULL;
+  size_t ech_name_len = 0;
+
+  if(!data || !leaf || !ssl)
+    goto out;
+
+  /* BoringSSL normally checks the ECH public name through X509_verify_cert.
+   * Preserve that check even when only Windows can establish trust. The
+   * ordinary hostname check remains in Curl_ossl_check_peer_cert(). */
+  SSL_get0_ech_name_override(ssl, &ech_name, &ech_name_len);
+  if(ech_name_len &&
+     X509_check_host(leaf, ech_name, ech_name_len, 0, NULL) != 1) {
+    verify_error = X509_V_ERR_HOSTNAME_MISMATCH;
+    goto out;
+  }
+
+  /* This store contains only caller-supplied CA sources, not imported
+   * Windows anchors. A failed check here does not preclude native trust. */
+  explicit_trust = X509_verify_cert(store_ctx);
+  ERR_clear_error();
+  if(explicit_trust < 0 || (config->CRLfile && explicit_trust != 1)) {
+    /* An explicitly requested CRL check must succeed even when Windows
+     * could independently establish trust. */
+    verify_error = X509_STORE_CTX_get_error(store_ctx);
+    if(verify_error == X509_V_OK)
+      verify_error = X509_V_ERR_APPLICATION_VERIFICATION;
+    goto out;
+  }
+  store = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0,
+                        CERT_STORE_CREATE_NEW_FLAG, NULL);
+  if(!store || !ossl_win_add_cert(store, leaf, &server))
+    goto win_error;
+
+  for(i = 0; certs && i < sk_X509_num(certs); ++i) {
+    if(!ossl_win_add_cert(store, sk_X509_value(certs, i), NULL))
+      goto win_error;
+  }
+  if(explicit_trust == 1) {
+    /* Include issuers found in CA files/paths as untrusted candidates for
+     * Windows, so its policy also checks the explicitly trusted chain. */
+    certs = X509_STORE_CTX_get0_chain(store_ctx);
+    for(i = 0; certs && i < sk_X509_num(certs); ++i) {
+      PCCERT_CONTEXT *context =
+        (i + 1 == sk_X509_num(certs)) ? &anchor : NULL;
+      if(!ossl_win_add_cert(store, sk_X509_value(certs, i), context))
+        goto win_error;
+    }
+  }
+
+  memset(&chain_para, 0, sizeof(chain_para));
+  chain_para.cbSize = sizeof(chain_para);
+  chain_para.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
+  chain_para.RequestedUsage.Usage.cUsageIdentifier = 1;
+  chain_para.RequestedUsage.Usage.rgpszUsageIdentifier = &usage;
+  /* Windows checks explicit distrust without online CRL/OCSP checking. */
+  if(!CertGetCertificateChain(NULL, server, NULL, store, &chain_para,
+                              0, NULL, &chain))
+    goto win_error;
+
+  /* Never let supplemental anchors bypass explicit distrust. */
+  if(chain->TrustStatus.dwErrorStatus & CERT_TRUST_IS_EXPLICIT_DISTRUST) {
+    error = (DWORD)TRUST_E_EXPLICIT_DISTRUST;
+    verify_error = X509_V_ERR_CERT_REJECTED;
+    goto out;
+  }
+
+  /* Windows may choose a different path. Only extend native trust if that
+   * path actually contains the anchor accepted by BoringSSL; otherwise an
+   * unrelated, untrusted alternate chain could bypass anchor restrictions. */
+  if(anchor && chain->cChain) {
+    PCERT_SIMPLE_CHAIN simple = chain->rgpChain[0];
+    for(i = 0; i < simple->cElement; ++i) {
+      PCCERT_CONTEXT cert = simple->rgpElement[i]->pCertContext;
+      if(cert->cbCertEncoded == anchor->cbCertEncoded &&
+         !memcmp(cert->pbCertEncoded, anchor->pbCertEncoded,
+                 anchor->cbCertEncoded)) {
+        have_anchor = TRUE;
+        break;
+      }
+    }
+  }
+
+  memset(&ssl_para, 0, sizeof(ssl_para));
+  ssl_para.cbSize = sizeof(ssl_para);
+  ssl_para.dwAuthType = AUTHTYPE_SERVER;
+  ssl_para.fdwChecks = SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
+  memset(&policy_para, 0, sizeof(policy_para));
+  policy_para.cbSize = sizeof(policy_para);
+  policy_para.pvExtraPolicyPara = &ssl_para;
+  if(have_anchor)
+    policy_para.dwFlags |= CERT_CHAIN_POLICY_ALLOW_UNKNOWN_CA_FLAG;
+  memset(&policy_status, 0, sizeof(policy_status));
+  policy_status.cbSize = sizeof(policy_status);
+  if(!CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL, chain,
+                                       &policy_para, &policy_status))
+    goto win_error;
+
+  error = policy_status.dwError;
+  switch(error) {
+  case 0:
+    verify_error = X509_V_OK;
+    break;
+  case (DWORD)CERT_E_REVOKED:
+    verify_error = X509_V_ERR_CERT_REVOKED;
+    break;
+  case (DWORD)CERT_E_EXPIRED:
+    verify_error = X509_V_ERR_CERT_HAS_EXPIRED;
+    break;
+  case (DWORD)CERT_E_UNTRUSTEDROOT:
+  case (DWORD)CERT_E_CHAINING:
+    verify_error = X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY;
+    break;
+  case (DWORD)CERT_E_WRONG_USAGE:
+    verify_error = X509_V_ERR_INVALID_PURPOSE;
+    break;
+  }
+  goto out;
+
+win_error:
+  error = GetLastError();
+out:
+  if(data) {
+    struct ssl_easy_config *ssl_config = Curl_ssl_cf_get_easy_config(cf, data);
+    ssl_config->certverifyresult = verify_error;
+  }
+  if(data && error)
+    failf(data, "SSL: Windows certificate verification failed: 0x%08lx",
+          (unsigned long)error);
+  if(chain)
+    CertFreeCertificateChain(chain);
+  if(server)
+    CertFreeCertificateContext(server);
+  if(anchor)
+    CertFreeCertificateContext(anchor);
+  if(store)
+    CertCloseStore(store, 0);
+  X509_STORE_CTX_set_error(store_ctx, verify_error);
+  return verify_error == X509_V_OK;
+}
+#endif /* USE_WIN32_NATIVE_VERIFY */
 #endif /* USE_WIN32_CRYPTO */
 
 static CURLcode ossl_load_trust_anchors(struct Curl_cfilter *cf,
@@ -2998,7 +3503,19 @@ static CURLcode ossl_load_trust_anchors(struct Curl_cfilter *cf,
 
   octx->store_is_empty = TRUE;
   if(conn_config->native_ca_store) {
-#ifdef USE_WIN32_CRYPTO
+#ifdef USE_WIN32_NATIVE_VERIFY
+    infof(data, "  Native: Windows certificate chain policy");
+    have_native_check = TRUE;
+    if(conn_config->CRLfile) {
+      bool added = FALSE;
+      /* Preserve the existing BoringSSL verification of explicit CRL files
+       * using the Windows anchors. Windows policy is still checked too. */
+      result = ossl_windows_load_anchors(cf, data, store, &added);
+      if(result)
+        return result;
+      octx->store_is_empty = !added;
+    }
+#elif defined(USE_WIN32_CRYPTO)
     bool added = FALSE;
     result = ossl_windows_load_anchors(cf, data, store, &added);
     if(result)
@@ -3079,7 +3596,11 @@ static CURLcode ossl_load_trust_anchors(struct Curl_cfilter *cf,
   }
 
 #ifdef CURL_CA_FALLBACK
-  if(octx->store_is_empty) {
+  if(octx->store_is_empty
+#ifdef USE_WIN32_NATIVE_VERIFY
+     && !conn_config->native_ca_store
+#endif
+    ) {
     /* verifying the peer without any CA certificates does not
        work so use OpenSSL's built-in default as fallback */
     X509_STORE_set_default_paths(store);
@@ -3493,11 +4014,37 @@ static CURLcode ossl_init_ech(struct ossl_ctx *octx,
 {
   struct ssl_filter_config *conn_config = Curl_ssl_cf_get_filter_config(cf);
   int trying_ech_now = 0;
+  int using_ech_retry = 0;
 
   if(!Curl_ssl_ech_enabled(cf))
     return CURLE_OK;
 
-  if(conn_config->ech == CURLECH_GREASE) {
+#ifdef HAVE_BORINGSSL_LIKE
+  if(cf->conn->ech_retry_attempted[cf->sockindex]) {
+    const unsigned char *retry_configs =
+      cf->conn->ech_retry_configs[cf->sockindex];
+    size_t retry_configs_len =
+      cf->conn->ech_retry_configs_len[cf->sockindex];
+
+    cf->conn->ech_retry_pending[cf->sockindex] = FALSE;
+    if(retry_configs_len) {
+      if(SSL_set1_ech_config_list(octx->ssl, retry_configs,
+                                  retry_configs_len) != 1) {
+        infof(data, "ECH: failed to apply retry configs");
+        return CURLE_SSL_CONNECT_ERROR;
+      }
+      trying_ech_now = 1;
+      infof(data, "ECH: retrying with server ECHConfigList of length %zu",
+            retry_configs_len);
+    }
+    else
+      infof(data, "ECH: retrying with ECH disabled by server");
+    using_ech_retry = 1;
+  }
+  else if(conn_config->ech == CURLECH_ENABLE)
+    SSL_set_enable_ech_grease(octx->ssl, 1);
+#endif /* HAVE_BORINGSSL_LIKE */
+  if(!using_ech_retry && conn_config->ech == CURLECH_GREASE) {
     infof(data, "ECH: will GREASE ClientHello");
 #ifdef HAVE_BORINGSSL_LIKE
     SSL_set_enable_ech_grease(octx->ssl, 1);
@@ -3505,7 +4052,8 @@ static CURLcode ossl_init_ech(struct ossl_ctx *octx,
     SSL_set_options(octx->ssl, SSL_OP_ECH_GREASE);
 #endif
   }
-  else if(conn_config->ech && conn_config->ech_config) {
+  else if(!using_ech_retry && conn_config->ech &&
+          conn_config->ech_config) {
 #ifdef HAVE_BORINGSSL_LIKE
     uint8_t *ech_config;
     size_t ech_config_len = 0;
@@ -3551,7 +4099,7 @@ static CURLcode ossl_init_ech(struct ossl_ctx *octx,
 #endif /* HAVE_BORINGSSL_LIKE */
     infof(data, "ECH: ECHConfig from command line");
   }
-  else {
+  else if(!using_ech_retry) {
     const struct Curl_https_rrinfo *rinfo =
       Curl_conn_dns_get_https(data, cf->sockindex, peer->origin);
 
@@ -3598,11 +4146,18 @@ static CURLcode ossl_init_ech(struct ossl_ctx *octx,
     }
   }
 #endif /* HAVE_BORINGSSL_LIKE */
-  if(trying_ech_now &&
-     SSL_set_min_proto_version(octx->ssl, TLS1_3_VERSION) != 1) {
+  /*
+   * BoringSSL/AWS-LC handle ECH's TLS version rules internally between
+   * ClientHelloInner/Outer. Do not force a global TLS minimum here so the
+   * outer behavior can match browsers.
+   */
+#ifndef HAVE_BORINGSSL_LIKE
+  if(trying_ech_now
+     && SSL_set_min_proto_version(octx->ssl, TLS1_3_VERSION) != 1) {
     infof(data, "ECH: cannot force TLSv1.3 [ERROR]");
     return CURLE_SSL_CONNECT_ERROR;
   }
+#endif
 
   return CURLE_OK;
 }
@@ -3616,6 +4171,11 @@ static CURLcode ossl_init_ssl(struct ossl_ctx *octx,
                               void *ssl_user_data,
                               Curl_ossl_init_session_reuse_cb *sess_reuse_cb)
 {
+#ifdef OPENSSL_IS_BORINGSSL
+  struct ssl_connect_data *connssl = cf->ctx;
+  const struct alpn_spec *alps = NULL;
+#endif
+
   /* Let's make an SSL structure */
   if(octx->ssl)
     SSL_free(octx->ssl);
@@ -3626,6 +4186,34 @@ static CURLcode ossl_init_ssl(struct ossl_ctx *octx,
   }
 
   SSL_set_app_data(octx->ssl, ssl_user_data);
+
+#ifdef OPENSSL_IS_BORINGSSL
+  if(data->set.ssl_enable_alps) {
+    if(peer->transport == TRNSPRT_QUIC)
+      alps = alpns_requested;
+    else
+      alps = connssl->alps;
+  }
+  if(alps) {
+    size_t i;
+    struct alpn_proto_buf proto;
+
+    /* Select the ALPS codepoint before adding any application settings. */
+    SSL_set_alps_use_new_codepoint(
+      octx->ssl, data->set.tls_use_new_alps_codepoint ? 1 : 0);
+
+    for(i = 0; i < alps->count; ++i) {
+      /* curl-impersonate: Add the ALPS extension like Chrome does. */
+      /* Firefox does not enable this. */
+      SSL_add_application_settings(octx->ssl, alps->entries[i],
+                                   strlen(alps->entries[i]), NULL,
+                                   0);
+    }
+
+    Curl_alpn_to_proto_str(&proto, alps);
+    infof(data, VTLS_INFOF_ALPS_OFFER_1STR, proto.data);
+  }
+#endif
 
 #ifndef OPENSSL_NO_OCSP
   if(Curl_ssl_cf_get_filter_config(cf)->verifystatus)
@@ -3706,9 +4294,124 @@ static CURLcode ossl_init_method(struct Curl_cfilter *cf,
   return *pmethod ? CURLE_OK : CURLE_SSL_CONNECT_ERROR;
 }
 
+#ifdef OPENSSL_IS_BORINGSSL
+static CURLcode set_trust_anchors(struct Curl_easy *data, SSL_CTX *ctx,
+                                  const char *anchors)
+{
+  CBB ids;
+  CURLcode result = CURLE_OK;
+  const char *start = anchors;
+  size_t id_count = 0;
+  size_t *offsets = NULL;
+  unsigned char *shuffled = NULL;
+
+  if(!anchors[0]) {
+    if(SSL_CTX_set1_requested_trust_anchors(ctx, NULL, 0))
+      return CURLE_OK;
+    failf(data, "failed setting empty TLS trust anchor list");
+    return CURLE_SSL_CONNECT_ERROR;
+  }
+
+  if(!CBB_init(&ids, 128))
+    return CURLE_OUT_OF_MEMORY;
+
+  for(;;) {
+    CBB id;
+    const char *end = start;
+    const char *next;
+
+    while(*end && (*end != ','))
+      end++;
+    next = end;
+    while((start < end) && ((*start == ' ') || (*start == '\t')))
+      start++;
+    while((end > start) && ((end[-1] == ' ') || (end[-1] == '\t')))
+      end--;
+    if((start == end) ||
+       !CBB_add_u8_length_prefixed(&ids, &id) ||
+       !CBB_add_asn1_relative_oid_from_text(&id, start,
+                                            (size_t)(end - start)) ||
+       !CBB_flush(&ids)) {
+      CBB_cleanup(&ids);
+      failf(data, "invalid TLS trust anchor list: '%s'", anchors);
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    }
+    id_count++;
+    if(!*next)
+      break;
+    start = next + 1;
+    if(!*start) {
+      CBB_cleanup(&ids);
+      failf(data, "invalid TLS trust anchor list: '%s'", anchors);
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    }
+  }
+
+  offsets = calloc(id_count, sizeof(*offsets));
+  shuffled = malloc(CBB_len(&ids));
+  if(!offsets || !shuffled) {
+    result = CURLE_OUT_OF_MEMORY;
+    goto out;
+  }
+
+  {
+    const unsigned char *encoded = CBB_data(&ids);
+    size_t i;
+    size_t offset = 0;
+
+    for(i = 0; i < id_count; i++) {
+      offsets[i] = offset;
+      offset += encoded[offset] + 1;
+    }
+
+    /* The IDs form a set. Randomize only the temporary wire order, leaving
+     * the configured value stable for connection and session cache keys. */
+    for(i = id_count; i > 1; i--) {
+      size_t random;
+      size_t threshold = (size_t)(-i) % i;
+      size_t selected;
+      size_t swap;
+
+      do {
+        result = Curl_rand(data, (unsigned char *)&random, sizeof(random));
+        if(result) {
+          failf(data, "failed randomizing TLS trust anchor list");
+          goto out;
+        }
+      } while(random < threshold);
+
+      selected = random % i;
+      swap = offsets[i - 1];
+      offsets[i - 1] = offsets[selected];
+      offsets[selected] = swap;
+    }
+
+    offset = 0;
+    for(i = 0; i < id_count; i++) {
+      size_t encoded_len = encoded[offsets[i]] + 1;
+      memcpy(&shuffled[offset], &encoded[offsets[i]], encoded_len);
+      offset += encoded_len;
+    }
+  }
+
+  if(!SSL_CTX_set1_requested_trust_anchors(ctx, shuffled, CBB_len(&ids))) {
+    result = CURLE_SSL_CONNECT_ERROR;
+    failf(data, "failed setting TLS trust anchor list");
+    goto out;
+  }
+
+out:
+  CBB_cleanup(&ids);
+  free(offsets);
+  free(shuffled);
+  return result;
+}
+#endif
+
 CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
                             struct Curl_cfilter *cf,
                             struct Curl_easy *data,
+                            struct cf_call_data *call_data,
                             struct ssl_peer *peer,
                             const struct alpn_spec *alpns_requested,
                             Curl_ossl_ctx_setup_cb *cb_setup,
@@ -3728,6 +4431,9 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
   const char * const ssl_cert_type = conn_config->cert_type;
   unsigned int ssl_version_min;
   char error_buffer[256];
+
+  octx->cf = cf;
+  octx->call_data = call_data;
 
   /* Make funny stuff to get random input */
   result = ossl_seed(data);
@@ -3810,7 +4516,15 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
      workarounds. In order to keep the secure workaround, the
      SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS bit must not be set. */
 
-  ctx_options = SSL_OP_ALL | SSL_OP_NO_TICKET | SSL_OP_NO_COMPRESSION;
+  ctx_options = SSL_OP_ALL;
+
+  if(conn_config->enable_ticket) {
+    /* Enable the TLS session ticket extension when requested. */
+    ctx_options &= ~SSL_OP_NO_TICKET;
+  }
+  else
+    ctx_options |= SSL_OP_NO_TICKET;
+  ctx_options |= SSL_OP_NO_COMPRESSION;
 
   /* mitigate CVE-2010-4180 */
   ctx_options &= ~(ctx_option_t)SSL_OP_NETSCAPE_REUSE_CIPHER_CHANGE_BUG;
@@ -3866,10 +4580,29 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
   /* We do retry writes sometimes from another buffer address */
   SSL_CTX_set_mode(octx->ssl_ctx, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 
+#ifdef OPENSSL_IS_BORINGSSL
+  SSL_CTX_set_options(octx->ssl_ctx, SSL_OP_LEGACY_SERVER_CONNECT);
+  SSL_CTX_set_mode(octx->ssl_ctx,
+                   SSL_MODE_CBC_RECORD_SPLITTING |
+                   SSL_MODE_ENABLE_FALSE_START);
+
+  /* Enable TLS extension 18, signed_certificate_timestamp. */
+  if(data->set.tls_signed_cert_timestamps)
+    SSL_CTX_enable_signed_cert_timestamps(octx->ssl_ctx);
+
+  /* Enable TLS extension 5, status_request. */
+  if(data->set.tls_status_request)
+    SSL_CTX_enable_ocsp_stapling(octx->ssl_ctx);
+#endif
+
   ciphers = conn_config->cipher_list;
   if(!ciphers && (peer->transport != TRNSPRT_QUIC))
     ciphers = NULL;
+#ifdef OPENSSL_IS_BORINGSSL
+  if(ciphers) {
+#else
   if(ciphers && (ssl_version_min < CURL_SSLVERSION_TLSv1_3)) {
+#endif
     if(!SSL_CTX_set_cipher_list(octx->ssl_ctx, ciphers)) {
       failf(data, "failed setting cipher list: %s", ciphers);
       return CURLE_SSL_CIPHER;
@@ -3910,7 +4643,8 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
 #endif
 
   {
-    const char *curves = conn_config->curves;
+    const char *curves =
+      Curl_ssl_config_get_curves(conn_config, peer->transport);
     if(curves) {
 #ifdef HAVE_BORINGSSL_LIKE
 #define OSSL_CURVE_CAST(x) (x)
@@ -3924,10 +4658,12 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
     }
   }
 
-#ifdef HAVE_SSL_CTX_SET1_SIGALGS
+#if defined(HAVE_SSL_CTX_SET1_SIGALGS) && \
+  !defined(OPENSSL_IS_BORINGSSL)
 #define OSSL_SIGALG_CAST(x) OSSL_CURVE_CAST(x)
   {
-    const char *signature_algorithms = conn_config->signature_algorithms;
+    const char *signature_algorithms =
+      Curl_ssl_config_get_signature_algorithms(conn_config, peer->transport);
     if(signature_algorithms) {
       if(!SSL_CTX_set1_sigalgs_list(octx->ssl_ctx,
                                     OSSL_SIGALG_CAST(signature_algorithms))) {
@@ -3939,11 +4675,121 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
   }
 #endif
 
+#ifdef HAVE_SSL_CTX_SET_VERIFY_ALGORITHM_PREFS
+  {
+    uint16_t algs[MAX_SIG_ALGS];
+    size_t nalgs;
+    /* curl-impersonate: Set the signature algorithms (TLS extension 13). */
+    const char *signature_algorithms =
+      Curl_ssl_config_get_signature_algorithms(conn_config, peer->transport);
+    if(signature_algorithms) {
+      CURLcode result = parse_sig_algs(data, signature_algorithms, algs,
+                                       &nalgs);
+      if(result)
+        return result;
+    }
+    else {
+      memcpy(algs, default_sig_algs, sizeof(default_sig_algs));
+      nalgs = DEFAULT_SIG_ALGS_LENGTH;
+    }
+    if(!SSL_CTX_set_signing_algorithm_prefs(octx->ssl_ctx, algs, nalgs) ||
+       !SSL_CTX_set_verify_algorithm_prefs(octx->ssl_ctx, algs, nalgs)) {
+      if(signature_algorithms)
+        failf(data, "failed setting signature algorithms: '%s'",
+              signature_algorithms);
+      else
+        failf(data, "failed setting default signature algorithms");
+      return CURLE_SSL_CIPHER;
+    }
+  }
+#endif
+
+#ifdef OPENSSL_IS_BORINGSSL
+  /* curl-impersonate:
+   * Configure BoringSSL to behave like Chrome.
+   * See Constructor of SSLContext at net/socket/ssl_client_socket_impl.cc
+   * and SSLClientSocketImpl::Init()
+   * in the Chromium's source code. */
+
+  /* curl-impersonate: Disable TLS GREASE for HTTP/3 (QUIC). */
+  if(peer->transport == TRNSPRT_QUIC)
+    SSL_CTX_set_grease_enabled(octx->ssl_ctx, 0);
+  else if(data->set.tls_grease)
+    SSL_CTX_set_grease_enabled(octx->ssl_ctx, 1);
+
+  if(conn_config->trust_anchors) {
+    CURLcode result = set_trust_anchors(data, octx->ssl_ctx,
+                                        conn_config->trust_anchors);
+    if(result)
+      return result;
+  }
+
+  /*
+   * curl-impersonate: Enable TLS extension permutation, enabled by default
+   * since Chrome 110.
+   */
+  if(data->set.ssl_permute_extensions && peer->transport != TRNSPRT_QUIC)
+    SSL_CTX_set_permute_extensions(octx->ssl_ctx, 1);
+
+  /* curl-impersonate: Enable HTTP/3-specific TLS extension
+   * permutation. */
+  if(conn_config->http3_ssl_permute_extensions &&
+     peer->transport == TRNSPRT_QUIC)
+    SSL_CTX_set_permute_extensions(octx->ssl_ctx, 1);
+
+  /* curl-impersonate: Set TLS extensions order. */
+  {
+    const char *extension_order = Curl_ssl_config_get_tls_extension_order(
+      conn_config, peer->transport);
+    if(extension_order &&
+       !SSL_CTX_set_extension_order(octx->ssl_ctx,
+                                    (char *)CURL_UNCONST(extension_order))) {
+      failf(data, "Invalid TLS extension order: '%s'", extension_order);
+      return CURLE_SSL_CONNECT_ERROR;
+    }
+  }
+
+  if(CURL_EASY_STR(data, STRING_TLS_DELEGATED_CREDENTIALS))
+    SSL_CTX_set_delegated_credentials(
+      octx->ssl_ctx, CURL_EASY_STR(data, STRING_TLS_DELEGATED_CREDENTIALS));
+
+  if(data->set.tls_record_size_limit)
+    SSL_CTX_set_record_size_limit(octx->ssl_ctx,
+                                  data->set.tls_record_size_limit);
+
+  if(data->set.tls_key_shares_limit)
+    SSL_CTX_set_key_shares_limit(octx->ssl_ctx,
+                                 data->set.tls_key_shares_limit);
+
+  /* curl-impersonate: Set key usage check. */
+  if(data->set.tls_key_usage_no_check)
+    SSL_CTX_set_key_usage_check_enabled(octx->ssl_ctx, 0);
+  else
+    SSL_CTX_set_key_usage_check_enabled(octx->ssl_ctx, 1);
+
+  if(conn_config->cert_compression && conn_config->cert_compression[0] &&
+     add_cert_compression(data,
+                          octx->ssl_ctx,
+                          conn_config->cert_compression))
+    return CURLE_SSL_CIPHER;
+#endif /* OPENSSL_IS_BORINGSSL */
   /* OpenSSL always tries to verify the peer. By setting the failure mode
    * to NONE, we allow the connect to complete, regardless of the outcome.
    * We then explicitly check the result and may try alternatives like
    * Apple's SecTrust for verification. */
   SSL_CTX_set_verify(octx->ssl_ctx, SSL_VERIFY_NONE, NULL);
+#ifdef USE_WIN32_NATIVE_VERIFY
+  if(conn_config->native_ca_store && conn_config->verifypeer) {
+    /* Set up explicit CA sources before the verification callback can run,
+     * including for QUIC. Native trust itself stays in the Windows engine. */
+    result = Curl_ssl_setup_x509_store(cf, data, octx);
+    if(result)
+      return result;
+    octx->x509_store_setup = TRUE;
+    SSL_CTX_set_verify(octx->ssl_ctx, SSL_VERIFY_PEER, NULL);
+    SSL_CTX_set_cert_verify_callback(octx->ssl_ctx, ossl_win_verify, octx);
+  }
+#endif
 
   /* Enable logging of secrets to the file specified in env SSLKEYLOGFILE. */
 #if !defined(HAVE_KEYLOG_UPSTREAM) && defined(HAVE_KEYLOG_CALLBACK)
@@ -4045,7 +4891,8 @@ static CURLcode ossl_connect_step1(struct Curl_cfilter *cf,
   DEBUGASSERT(octx);
   DEBUGASSERT(connssl->peer.origin);
 
-  result = Curl_ossl_ctx_init(octx, cf, data, &connssl->peer,
+  result = Curl_ossl_ctx_init(octx, cf, data, &connssl->call_data,
+                              &connssl->peer,
                               connssl->alpn, NULL, NULL,
                               ossl_new_session_cb, cf,
                               ossl_on_session_reuse);
@@ -4147,6 +4994,40 @@ static int ossl_trace_ech_retry_configs(struct Curl_cfilter *cf,
 #endif
   return rv;
 }
+
+#ifdef HAVE_BORINGSSL_LIKE
+static CURLcode ossl_prepare_ech_retry(struct Curl_cfilter *cf,
+                                       struct Curl_easy *data,
+                                       SSL *ssl)
+{
+  struct connectdata *conn = cf->conn;
+  struct ssl_filter_config *conn_config = Curl_ssl_cf_get_filter_config(cf);
+  const uint8_t *retry_configs = NULL;
+  unsigned char *copy = NULL;
+  size_t retry_configs_len = 0;
+  int8_t sockindex = cf->sockindex;
+
+  if(conn_config->ech != CURLECH_ENABLE)
+    return CURLE_ECH_REQUIRED;
+  if(conn->ech_retry_attempted[sockindex])
+    return CURLE_ECH_REQUIRED;
+
+  SSL_get0_ech_retry_configs(ssl, &retry_configs, &retry_configs_len);
+  if(retry_configs_len) {
+    copy = curlx_memdup(retry_configs, retry_configs_len);
+    if(!copy)
+      return CURLE_OUT_OF_MEMORY;
+  }
+
+  curlx_safefree(conn->ech_retry_configs[sockindex]);
+  conn->ech_retry_configs[sockindex] = copy;
+  conn->ech_retry_configs_len[sockindex] = retry_configs_len;
+  conn->ech_retry_attempted[sockindex] = TRUE;
+  conn->ech_retry_pending[sockindex] = TRUE;
+  infof(data, "ECH: restarting connection with server retry configs");
+  return CURLE_AGAIN;
+}
+#endif /* HAVE_BORINGSSL_LIKE */
 
 #endif
 
@@ -4274,6 +5155,13 @@ static CURLcode ossl_connect_step2(struct Curl_cfilter *cf,
         /* trace retry_configs if we got some */
         ossl_trace_ech_retry_configs(cf, data, octx->ssl, reason);
 
+#ifdef HAVE_BORINGSSL_LIKE
+        result = ossl_prepare_ech_retry(cf, data, octx->ssl);
+        if(result == CURLE_AGAIN)
+          return result;
+        if(result != CURLE_ECH_REQUIRED)
+          return result;
+#endif
         result = CURLE_ECH_REQUIRED;
         failf(data, "ECH: rejected, %s",
               ossl_strerror(errdetail, error_buffer, sizeof(error_buffer)));
@@ -4281,8 +5169,10 @@ static CURLcode ossl_connect_step2(struct Curl_cfilter *cf,
 #endif
       else {
         result = CURLE_SSL_CONNECT_ERROR;
-        failf(data, "TLS connect error: %s",
-              ossl_strerror(errdetail, error_buffer, sizeof(error_buffer)));
+        if(errdetail)
+          failf(data, "TLS connect error: %s",
+                ossl_strerror(errdetail, error_buffer,
+                              sizeof(error_buffer)));
       }
 
       /* detail is already set to the SSL error above */
@@ -4295,10 +5185,20 @@ static CURLcode ossl_connect_step2(struct Curl_cfilter *cf,
         char extramsg[80] = "";
         int sockerr = SOCKERRNO;
 
-        if(sockerr && detail == SSL_ERROR_SYSCALL)
+        if(octx->io_result && octx->io_result != CURLE_AGAIN)
+          curl_msnprintf(extramsg, sizeof(extramsg), "%s",
+                         curl_easy_strerror(octx->io_result));
+        else if(connssl->peer_closed)
+          curl_msnprintf(extramsg, sizeof(extramsg),
+                         "Connection closed abruptly");
+        else if(sockerr && detail == SSL_ERROR_SYSCALL)
           curlx_strerror(sockerr, extramsg, sizeof(extramsg));
-        failf(data, OSSL_PACKAGE " SSL_connect: %s in connection to %s:%d ",
-              extramsg[0] ? extramsg : SSL_ERROR_to_str(detail),
+        else
+          curl_msnprintf(extramsg, sizeof(extramsg),
+                         "no transport error details available");
+        failf(data, OSSL_PACKAGE " SSL_connect: %s (%s; error queue empty) "
+              "in connection to %s:%d",
+              extramsg, SSL_ERROR_to_str(detail),
               connssl->peer.origin->hostname, connssl->peer.origin->port);
       }
 
@@ -4309,6 +5209,22 @@ static CURLcode ossl_connect_step2(struct Curl_cfilter *cf,
     /* we connected fine, we are not waiting for anything else. */
     connssl->connecting_state = ssl_connect_3;
     Curl_ossl_report_handshake(data, octx);
+
+#ifdef OPENSSL_IS_BORINGSSL
+    {
+      const unsigned char *neg_protocol;
+      unsigned int len;
+
+      SSL_get0_alpn_selected(octx->ssl, &neg_protocol, &len);
+      if(!len ||
+         (len == ALPN_HTTP_1_1_LENGTH &&
+          !memcmp(neg_protocol, ALPN_HTTP_1_1, len))) {
+        /* Chrome permits renegotiation for HTTP/1.1 connections. Limit it
+         * to one server-initiated renegotiation. */
+        SSL_set_renegotiate_mode(octx->ssl, ssl_renegotiate_once);
+      }
+    }
+#endif
 
 #if defined(HAVE_SSL_SET1_ECH_CONFIG_LIST) && !defined(HAVE_BORINGSSL_LIKE)
     if(Curl_ssl_ech_enabled(cf)) {
@@ -4831,8 +5747,14 @@ CURLcode Curl_ossl_check_peer_cert(struct Curl_cfilter *cf,
   infof(data, "OpenSSL verify result: %lx", (unsigned long)ossl_verify);
 
   verified = (ossl_verify == X509_V_OK);
-  if(verified)
-    infof(data, "SSL certificate verified via OpenSSL.");
+  if(verified) {
+#ifdef USE_WIN32_NATIVE_VERIFY
+    if(conn_config->native_ca_store && conn_config->verifypeer)
+      infof(data, "SSL certificate verified via Windows chain policy.");
+    else
+#endif
+      infof(data, "SSL certificate verified via OpenSSL.");
+  }
 
 #ifdef USE_APPLE_SECTRUST
   if(!verified && conn_config->verifypeer && conn_config->native_ca_store) {
@@ -5065,6 +5987,16 @@ static CURLcode ossl_connect(struct Curl_cfilter *cf,
 
 out:
   if(result == CURLE_AGAIN) {
+#if defined(HAVE_SSL_SET1_ECH_CONFIG_LIST) && \
+    defined(HAVE_BORINGSSL_LIKE)
+    /* Only the origin TLS filter may request an ECH restart. The pending
+     * flag survives rebuilding the chain, including proxy TLS handshakes. */
+    if(!Curl_ssl_cf_is_proxy(cf) &&
+       cf->conn->ech_retry_pending[cf->sockindex]) {
+      *done = FALSE;
+      return result;
+    }
+#endif
     *done = FALSE;
     return CURLE_OK;
   }

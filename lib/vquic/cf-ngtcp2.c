@@ -426,10 +426,182 @@ static nghttp3_callbacks ngh3_callbacks = {
 #pragma GCC diagnostic pop
 #endif
 
+static void h3_apply_setting(nghttp3_settings *settings,
+                             unsigned long id, uint64_t value)
+{
+  switch(id) {
+  case 1: /* SETTINGS_QPACK_MAX_TABLE_CAPACITY */
+    if(value > (uint64_t)SIZE_MAX)
+      value = (uint64_t)SIZE_MAX;
+    settings->qpack_max_dtable_capacity = (size_t)value;
+    settings->qpack_encoder_max_dtable_capacity = (size_t)value;
+    break;
+  case 6: /* SETTINGS_MAX_FIELD_SECTION_SIZE */
+    settings->max_field_section_size = value;
+    break;
+  case 7: /* SETTINGS_QPACK_BLOCKED_STREAMS */
+    if(value > (uint64_t)SIZE_MAX)
+      value = (uint64_t)SIZE_MAX;
+    settings->qpack_blocked_streams = (size_t)value;
+    break;
+  case 8: /* SETTINGS_ENABLE_CONNECT_PROTOCOL */
+    settings->enable_connect_protocol = (uint8_t)(value ? 1 : 0);
+    break;
+  case 51: /* SETTINGS_H3_DATAGRAM */
+    settings->h3_datagram = (uint8_t)(value ? 1 : 0);
+    break;
+  default:
+    break;
+  }
+}
+
+static bool h3_setting_supported(unsigned long id)
+{
+  switch(id) {
+  case 1:
+  case 6:
+  case 7:
+  case 8:
+  case 51:
+  case 727725890:
+  case 16765559:
+    return TRUE;
+  default:
+    return FALSE;
+  }
+}
+
+/* HTTP/3 GREASE setting identifiers follow: 0x1f * N + 0x21 */
+#define H3_SETTINGS_GREASE_ID_BASE  UINT64_C(0x21)
+#define H3_SETTINGS_GREASE_ID_STEP  UINT64_C(0x1f)
+
+/* Chrome uses a narrower uint32_t range than RFC 9114 allows:
+   https://quiche.googlesource.com/quiche/+/refs/heads/main/quiche/quic/core/http/quic_send_control_stream.cc */
+static bool h3_rand_u32(struct Curl_easy *data, uint32_t *val)
+{
+  unsigned char rnd[sizeof(uint32_t)];
+  CURLcode result;
+  size_t i;
+
+  result = Curl_rand(data, rnd, sizeof(rnd));
+  if(result)
+    return FALSE;
+
+  *val = 0;
+  for(i = 0; i < sizeof(rnd); ++i)
+    *val = (*val << 8) | rnd[i];
+
+  return TRUE;
+}
+
+static bool h3_generate_grease_setting(struct Curl_easy *data,
+                                       nghttp3_settings_entry *iv)
+{
+  uint32_t n;
+  uint32_t value;
+
+  if(!h3_rand_u32(data, &n) || !h3_rand_u32(data, &value))
+    return FALSE;
+
+  iv->id = (H3_SETTINGS_GREASE_ID_STEP * (uint64_t)n) +
+           H3_SETTINGS_GREASE_ID_BASE;
+  iv->value = value;
+  return TRUE;
+}
+
+static size_t h3_settings_count(const char *h3_settings)
+{
+  size_t count = 0;
+
+  if(h3_settings && *h3_settings) {
+    const char *p;
+
+    count = 1;
+    for(p = h3_settings; *p; ++p) {
+      if(*p == ';')
+        ++count;
+    }
+  }
+
+  return count;
+}
+
+static size_t populate_h3_settings(nghttp3_settings_entry *iv,
+                                   size_t ivlen,
+                                   nghttp3_settings *settings,
+                                   struct Curl_easy *data)
+{
+  const char *h3_settings = CURL_EASY_STR(data, STRING_HTTP3_SETTINGS);
+  char *tmp;
+  char *setting;
+  size_t i = 0;
+
+  if(!h3_settings || !*h3_settings)
+    return 0;
+
+  tmp = curlx_strdup(h3_settings);
+  if(!tmp)
+    return 0;
+
+  setting = strtok(tmp, ";");
+  while(setting) {
+    char *colon = strchr(setting, ':');
+    char *end = NULL;
+    unsigned long id;
+    unsigned long long value;
+
+    if(curl_strequal(setting, "GREASE")) {
+      if(iv && (i < ivlen)) {
+        if(h3_generate_grease_setting(data, &iv[i]))
+          ++i;
+      }
+      setting = strtok(NULL, ";");
+      continue;
+    }
+
+    if(!colon) {
+      setting = strtok(NULL, ";");
+      continue;
+    }
+    *colon = '\0';
+    id = strtoul(setting, &end, 10);
+    if(!*setting || (end && *end)) {
+      setting = strtok(NULL, ";");
+      continue;
+    }
+    value = strtoull(colon + 1, &end, 10);
+    if(!*(colon + 1) || (end && *end)) {
+      setting = strtok(NULL, ";");
+      continue;
+    }
+
+    if(!h3_setting_supported(id)) {
+      setting = strtok(NULL, ";");
+      continue;
+    }
+
+    h3_apply_setting(settings, id, (uint64_t)value);
+    if(iv && (i < ivlen)) {
+      iv[i].id = id;
+      iv[i].value = (uint64_t)value;
+      ++i;
+    }
+    setting = strtok(NULL, ";");
+  }
+
+  curlx_free(tmp);
+  return i;
+}
+
+
 static CURLcode init_ngh3_conn(struct Curl_cfilter *cf,
                                struct Curl_easy *data,
                                struct cf_ngtcp2_ctx *ctx)
 {
+  const char *h3_settings = CURL_EASY_STR(data, STRING_HTTP3_SETTINGS);
+  nghttp3_settings_entry *h3iv = NULL;
+  size_t h3ivalloc = 0;
+  size_t h3ivlen = 0;
   int rc;
 
   if(ngtcp2_conn_get_streams_uni_left(ctx->qconn) < 3) {
@@ -437,7 +609,16 @@ static CURLcode init_ngh3_conn(struct Curl_cfilter *cf,
     return CURLE_QUIC_CONNECT_ERROR;
   }
 
+  h3ivalloc = h3_settings_count(h3_settings);
+  if(h3ivalloc) {
+    h3iv = curlx_malloc(h3ivalloc * sizeof(*h3iv));
+    if(!h3iv)
+      return CURLE_OUT_OF_MEMORY;
+  }
+
   nghttp3_settings_default(&ctx->h3settings);
+  h3ivlen = populate_h3_settings(h3iv, h3ivalloc,
+                                 &ctx->h3settings, data);
 
   rc = nghttp3_conn_client_new(&ctx->h3conn,
                                &ngh3_callbacks,
@@ -445,9 +626,22 @@ static CURLcode init_ngh3_conn(struct Curl_cfilter *cf,
                                Curl_nghttp3_mem(),
                                cf);
   if(rc) {
+    curlx_free(h3iv);
     failf(data, "error creating nghttp3 connection instance");
     return CURLE_OUT_OF_MEMORY;
   }
+
+  if(h3ivlen) {
+    rc = nghttp3_conn_submit_settings(ctx->h3conn, 0, h3iv, h3ivlen);
+    curlx_free(h3iv);
+    if(rc) {
+      failf(data, "error submitting HTTP/3 settings: %s",
+            nghttp3_strerror(rc));
+      return CURLE_QUIC_CONNECT_ERROR;
+    }
+  }
+  else
+    curlx_free(h3iv);
 
   return Curl_cf_ngtcp2_h3_init_ctrls(ctx, data);
 }
@@ -1084,7 +1278,7 @@ CURLcode Curl_cf_ngtcp2_create(struct Curl_cfilter **pcf,
     goto out;
   }
   result = Curl_cf_ngtcp2_ctx_init(ctx, origin, peer,
-                                   &conn->ssl_config, init_ngh3_conn);
+                                   &conn->ssl_config, conn, init_ngh3_conn);
   if(!result)
     result = Curl_cf_create(&cf, &Curl_cft_http3, ctx);
   if(result)
@@ -1126,7 +1320,8 @@ CURLcode Curl_cf_ngtcp2_insert_after(struct Curl_cfilter *cf_at,
     goto out;
   }
   result = Curl_cf_ngtcp2_ctx_init(ctx, origin, peer,
-                                   &cf_at->conn->ssl_config, init_ngh3_conn);
+                                   &cf_at->conn->ssl_config, cf_at->conn,
+                                   init_ngh3_conn);
   if(!result)
     result = Curl_cf_create(&cf, &Curl_cft_http3, ctx);
   if(result)

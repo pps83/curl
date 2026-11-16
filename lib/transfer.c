@@ -74,7 +74,25 @@
 #include "rtsp.h"
 
 #if !defined(CURL_DISABLE_HTTP) || !defined(CURL_DISABLE_SMTP) || \
-  !defined(CURL_DISABLE_IMAP)
+    !defined(CURL_DISABLE_IMAP)
+struct curl_slist *Curl_http_request_headers(const struct Curl_easy *data)
+{
+  struct curl_slist *head =
+    data->state.merged_headers ? data->state.merged_headers :
+    data->set.headers;
+
+  if(data->conn && data->conn->scheme &&
+     (data->conn->scheme->protocol & (CURLPROTO_WS | CURLPROTO_WSS)) &&
+     data->set.ws_headers)
+    return data->set.ws_headers;
+
+  if(data->conn && (Curl_conn_http_version((struct Curl_easy *)data,
+                                           data->conn) == 30) &&
+     data->set.http3_headers)
+    return data->set.http3_headers;
+
+  return head;
+}
 /*
  * checkheaders() checks the linked list of custom headers for a
  * particular header (prefix). Provide the prefix without colon!
@@ -89,7 +107,9 @@ char *Curl_checkheaders(const struct Curl_easy *data,
   DEBUGASSERT(thislen);
   DEBUGASSERT(thisheader[thislen - 1] != ':');
 
-  for(head = data->set.headers; head; head = head->next) {
+  head = Curl_http_request_headers(data);
+
+  for(; head; head = head->next) {
     if(curl_strnequal(head->data, thisheader, thislen) &&
        Curl_headersep(head->data[thislen]))
       return head->data;

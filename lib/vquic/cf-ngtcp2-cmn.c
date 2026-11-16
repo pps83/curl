@@ -62,6 +62,8 @@
 #include "http1.h"
 #include "select.h"
 #include "sockaddr.h"
+#include "socks.h"
+#include "strcase.h"
 #include "transfer.h"
 #include "bufref.h"
 #include "vdns/cf-dns.h"
@@ -119,6 +121,7 @@ CURLcode Curl_cf_ngtcp2_ctx_init(struct cf_ngtcp2_ctx *ctx,
                                  struct Curl_peer *origin,
                                  struct Curl_peer *peer,
                                  struct ssl_filter_config *sslc,
+                                 struct connectdata *conn,
                                  cf_ngtcp2_init_h3_conn *init_h3_conn_cb)
 {
   DEBUGASSERT(!ctx->initialized);
@@ -129,10 +132,11 @@ CURLcode Curl_cf_ngtcp2_ctx_init(struct cf_ngtcp2_ctx *ctx,
   Curl_bufcp_init(&ctx->stream_bufcp, H3_STREAM_CHUNK_SIZE,
                   H3_STREAM_POOL_SPARES);
   curlx_dyn_init(&ctx->scratch, CURL_MAX_HTTP_HEADER);
+  curlx_dyn_init(&ctx->tp_raw, CURL_MAX_INPUT_LENGTH);
   Curl_u32_ptrset_init(&ctx->streams, h3_stream_set_free);
   ctx->init_h3_conn_cb = init_h3_conn_cb;
   ctx->initialized = TRUE;
-  return Curl_vquic_tls_peer_init(origin, peer, sslc, &ctx->ssl_peer);
+  return Curl_vquic_tls_peer_init(origin, peer, sslc, &ctx->ssl_peer, conn);
 }
 
 void Curl_cf_ngtcp2_ctx_cleanup(struct cf_ngtcp2_ctx *ctx)
@@ -162,6 +166,7 @@ void Curl_cf_ngtcp2_ctx_cleanup(struct cf_ngtcp2_ctx *ctx)
 #endif
     Curl_bufcp_free(&ctx->stream_bufcp);
     curlx_dyn_free(&ctx->scratch);
+    curlx_dyn_free(&ctx->tp_raw);
     Curl_u32_ptrset_clear(&ctx->streams);
     Curl_ssl_peer_cleanup(&ctx->ssl_peer);
     curlx_safefree(ctx->tunnel_inbuf);
@@ -226,12 +231,733 @@ static void qlog_callback(void *user_data, uint32_t flags,
   }
 }
 
-static void quic_settings(struct cf_ngtcp2_ctx *ctx,
-                          struct Curl_easy *data,
-                          struct cf_ngtcp2_io_ctx *pktx)
+/* Walk the filter chain to find the active socket for QUIC logging. */
+static CURLcode cf_ngtcp2_peek_socket(struct Curl_cfilter *cf,
+                                      struct Curl_easy *data,
+                                      curl_socket_t *psock,
+                                      const struct Curl_sockaddr_ex **paddr,
+                                      struct ip_quadruple *pip)
+{
+  bool got_sock = FALSE;
+  bool got_addr = FALSE;
+  bool got_ip = FALSE;
+  int dummy = 0;
+
+  if(!Curl_cf_socks_proxy_is_udp_associate(cf))
+    return Curl_cf_socket_peek(cf, data, psock, paddr, pip);
+
+  for(; cf; cf = cf->next) {
+    if(!got_sock && (psock || pip) &&
+       !Curl_cf_socket_peek(cf, data, psock, NULL, pip)) {
+      got_sock = (psock != NULL);
+      got_ip = (pip != NULL);
+    }
+    if(paddr && !got_addr) {
+      const struct Curl_sockaddr_ex *addr = NULL;
+      if(!cf->cft->query(cf, data, CF_QUERY_REMOTE_ADDR, &dummy, &addr) &&
+         addr) {
+        *paddr = addr;
+        got_addr = TRUE;
+      }
+    }
+    if((!psock || got_sock) && (!paddr || got_addr) && (!pip || got_ip))
+      return CURLE_OK;
+  }
+  return CURLE_FAILED_INIT;
+}
+
+static bool quic_has_empty_initial_scid(const char *params)
+{
+  const char *p = params;
+
+  if(!p || !*p)
+    return FALSE;
+
+  while(*p) {
+    const char *end;
+    size_t len;
+
+    while(*p == ';')
+      ++p;
+    if(!*p)
+      break;
+
+    end = strchr(p, ';');
+    len = end ? (size_t)(end - p) : strlen(p);
+    if((len == 3) && (p[0] == '1') && (p[1] == '5') && (p[2] == ':'))
+      return TRUE;
+
+    p = end ? (end + 1) : (p + len);
+  }
+
+  return FALSE;
+}
+
+/* https://www.iana.org/assignments/quic/quic.xhtml */
+static CURLcode quic_apply_transport_param(ngtcp2_transport_params *t,
+                                           uint64_t id,
+                                           uint64_t value,
+                                           bool has_value,
+                                           struct Curl_easy *data)
+{
+  switch(id) {
+  case 0x00: /* original_destination_connection_id (server only) */
+  case 0x02: /* stateless_reset_token (server only) */
+  case 0x0d: /* preferred_address (server only) */
+  case 0x10: /* retry_source_connection_id (server only) */
+  case 0x11: /* version_information (server only) */
+  case 0xff73db: /* version_information_draft (server only) */
+    failf(data, "QUIC transport param %" PRIu64 " is server-only",
+          (uint64_t)id);
+    return CURLE_BAD_FUNCTION_ARGUMENT;
+  case 0x0f: /* initial_source_connection_id (set by library) */
+    failf(data, "QUIC transport param %" PRIu64
+          " is managed by the library", (uint64_t)id);
+    return CURLE_BAD_FUNCTION_ARGUMENT;
+  case 0x01: /* max_idle_timeout (milliseconds) */
+    if(!has_value)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    t->max_idle_timeout = (ngtcp2_duration)value * NGTCP2_MILLISECONDS;
+    break;
+  case 0x03: /* max_udp_payload_size */
+    if(!has_value)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    t->max_udp_payload_size = value;
+    break;
+  case 0x04: /* initial_max_data */
+    if(!has_value)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    t->initial_max_data = value;
+    break;
+  case 0x05: /* initial_max_stream_data_bidi_local */
+    if(!has_value)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    t->initial_max_stream_data_bidi_local = value;
+    break;
+  case 0x06: /* initial_max_stream_data_bidi_remote */
+    if(!has_value)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    t->initial_max_stream_data_bidi_remote = value;
+    break;
+  case 0x07: /* initial_max_stream_data_uni */
+    if(!has_value)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    t->initial_max_stream_data_uni = value;
+    break;
+  case 0x08: /* initial_max_streams_bidi */
+    if(!has_value)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    t->initial_max_streams_bidi = value;
+    break;
+  case 0x09: /* initial_max_streams_uni */
+    if(!has_value)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    t->initial_max_streams_uni = value;
+    break;
+  case 0x0a: /* ack_delay_exponent */
+    if(!has_value)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    t->ack_delay_exponent = value;
+    break;
+  case 0x0b: /* max_ack_delay (milliseconds) */
+    if(!has_value)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    t->max_ack_delay = (ngtcp2_duration)value * NGTCP2_MILLISECONDS;
+    break;
+  case 0x0c: /* disable_active_migration */
+    t->disable_active_migration = (uint8_t)(!has_value || value);
+    break;
+  case 0x0e: /* active_connection_id_limit */
+    if(!has_value)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    t->active_connection_id_limit = value;
+    break;
+  case 0x20: /* max_datagram_frame_size */
+    if(!has_value)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    t->max_datagram_frame_size = value;
+    break;
+  case 0x2ab2: /* grease_quic_bit */
+    t->grease_quic_bit = (uint8_t)(!has_value || value);
+    break;
+  default:
+    infof(data, "QUIC transport param %" PRIu64
+          " is not mapped to ngtcp2_transport_params",
+          (uint64_t)id);
+    break;
+  }
+
+  return CURLE_OK;
+}
+
+#define QUIC_VARINT_MAX UINT64_C(0x3fffffffffffffff)
+#define QUIC_TP_INITIAL_SOURCE_CONNECTION_ID UINT64_C(0x0f)
+#define QUIC_TP_VERSION_INFORMATION          UINT64_C(0x11)
+#define QUIC_TP_VERSION_INFORMATION_DRAFT    UINT64_C(0xff73db)
+#define QUIC_TP_INITIAL_RTT                  UINT64_C(0x3127)
+#define QUIC_TP_GOOGLE_VERSION               UINT64_C(0x4752)
+#define QUIC_TP_GREASE_ID_BASE              UINT64_C(27)
+#define QUIC_TP_GREASE_ID_STEP              UINT64_C(31)
+#define QUIC_TP_GREASE_VALUE_MAXLEN         8
+#define QUIC_INITIAL_RTT_US_BASE             UINT64_C(333000)
+#define QUIC_INITIAL_RTT_US_JITTER           UINT64_C(50000)
+
+static uint64_t quic_initial_rtt_auto_us(struct Curl_easy *data)
+{
+  /* Use RFC9002 default initial RTT with moderate jitter for
+   * fingerprinting. */
+  uint64_t value = QUIC_INITIAL_RTT_US_BASE;
+  unsigned char rnd[2];
+  uint64_t span;
+  uint64_t off;
+
+  if(Curl_rand(data, rnd, sizeof(rnd)))
+    return value;
+
+  span = (QUIC_INITIAL_RTT_US_JITTER * 2) + 1;
+  off = ((((uint64_t)rnd[0]) << 8) | rnd[1]) % span;
+  value = (QUIC_INITIAL_RTT_US_BASE - QUIC_INITIAL_RTT_US_JITTER) + off;
+  return value;
+}
+
+static uint32_t quic_version_grease(struct Curl_easy *data)
+{
+  unsigned char rnd[4];
+  uint32_t v = 0x0a0a0a0aU;
+
+  if(Curl_rand(data, rnd, sizeof(rnd)))
+    return v;
+
+  v = (uint32_t)(((rnd[0] & 0xf0U) | 0x0aU) << 24);
+  v |= (uint32_t)(((rnd[1] & 0xf0U) | 0x0aU) << 16);
+  v |= (uint32_t)(((rnd[2] & 0xf0U) | 0x0aU) << 8);
+  v |= (uint32_t)((rnd[3] & 0xf0U) | 0x0aU);
+  return v;
+}
+
+static CURLcode quic_rand_u64(struct Curl_easy *data, uint64_t *val)
+{
+  unsigned char rnd[sizeof(uint64_t)];
+  CURLcode result;
+  size_t i;
+
+  result = Curl_rand(data, rnd, sizeof(rnd));
+  if(result)
+    return result;
+
+  *val = 0;
+  for(i = 0; i < sizeof(rnd); ++i)
+    *val = (*val << 8) | rnd[i];
+
+  return CURLE_OK;
+}
+
+static CURLcode quic_generate_grease_tp(struct Curl_easy *data,
+                                        uint64_t *pid,
+                                        unsigned char *value,
+                                        size_t *vlen)
+{
+  uint64_t n;
+  uint64_t max_n = (QUIC_VARINT_MAX - QUIC_TP_GREASE_ID_BASE) /
+                   QUIC_TP_GREASE_ID_STEP;
+  unsigned char lenrnd;
+  CURLcode result;
+
+  result = quic_rand_u64(data, &n);
+  if(result)
+    return result;
+
+  *pid = (QUIC_TP_GREASE_ID_STEP * (n % (max_n + 1))) +
+         QUIC_TP_GREASE_ID_BASE;
+
+  result = Curl_rand(data, &lenrnd, sizeof(lenrnd));
+  if(result)
+    return result;
+
+  *vlen = (size_t)(lenrnd % QUIC_TP_GREASE_VALUE_MAXLEN) + 1;
+  return Curl_rand(data, value, *vlen);
+}
+
+static CURLcode quic_permute_token_order(char **tokens, size_t ntokens,
+                                         struct Curl_easy *data)
+{
+  size_t i;
+
+  DEBUGASSERT(ntokens > 1);
+  for(i = ntokens - 1; i > 0; --i) {
+    uint64_t r;
+    size_t j;
+    char *tmp;
+    CURLcode result = quic_rand_u64(data, &r);
+    if(result)
+      return result;
+    j = (size_t)(r % (i + 1));
+    if(i == j)
+      continue;
+    tmp = tokens[i];
+    tokens[i] = tokens[j];
+    tokens[j] = tmp;
+  }
+
+  return CURLE_OK;
+}
+
+static size_t quic_varint_encode(uint8_t *buf, uint64_t value)
+{
+  if(value <= UINT64_C(0x3f)) {
+    buf[0] = (uint8_t)value;
+    return 1;
+  }
+  if(value <= UINT64_C(0x3fff)) {
+    buf[0] = (uint8_t)(0x40 | (value >> 8));
+    buf[1] = (uint8_t)value;
+    return 2;
+  }
+  if(value <= UINT64_C(0x3fffffff)) {
+    buf[0] = (uint8_t)(0x80 | (value >> 24));
+    buf[1] = (uint8_t)(value >> 16);
+    buf[2] = (uint8_t)(value >> 8);
+    buf[3] = (uint8_t)value;
+    return 4;
+  }
+  if(value <= QUIC_VARINT_MAX) {
+    buf[0] = (uint8_t)(0xc0 | (value >> 56));
+    buf[1] = (uint8_t)(value >> 48);
+    buf[2] = (uint8_t)(value >> 40);
+    buf[3] = (uint8_t)(value >> 32);
+    buf[4] = (uint8_t)(value >> 24);
+    buf[5] = (uint8_t)(value >> 16);
+    buf[6] = (uint8_t)(value >> 8);
+    buf[7] = (uint8_t)value;
+    return 8;
+  }
+  return 0;
+}
+
+static CURLcode quic_raw_append_param(struct dynbuf *raw,
+                                      uint64_t id,
+                                      uint64_t value,
+                                      bool has_value)
+{
+  uint8_t idbuf[8];
+  uint8_t lenbuf[8];
+  uint8_t valbuf[8];
+  size_t idlen;
+  size_t vlen = 0;
+  size_t lenlen;
+  CURLcode result;
+
+  idlen = quic_varint_encode(idbuf, id);
+  if(!idlen)
+    return CURLE_BAD_FUNCTION_ARGUMENT;
+
+  if(has_value) {
+    vlen = quic_varint_encode(valbuf, value);
+    if(!vlen)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+  }
+
+  lenlen = quic_varint_encode(lenbuf, (uint64_t)vlen);
+  if(!lenlen)
+    return CURLE_BAD_FUNCTION_ARGUMENT;
+
+  result = curlx_dyn_addn(raw, (const char *)idbuf, idlen);
+  if(result)
+    return result;
+  result = curlx_dyn_addn(raw, (const char *)lenbuf, lenlen);
+  if(result)
+    return result;
+  if(vlen) {
+    result = curlx_dyn_addn(raw, (const char *)valbuf, vlen);
+    if(result)
+      return result;
+  }
+
+  return CURLE_OK;
+}
+
+static CURLcode quic_raw_append_param_bytes(struct dynbuf *raw,
+                                            uint64_t id,
+                                            const uint8_t *value,
+                                            size_t vlen)
+{
+  uint8_t idbuf[8];
+  uint8_t lenbuf[8];
+  size_t idlen;
+  size_t lenlen;
+  CURLcode result;
+
+  if(vlen && !value)
+    return CURLE_BAD_FUNCTION_ARGUMENT;
+
+  idlen = quic_varint_encode(idbuf, id);
+  if(!idlen)
+    return CURLE_BAD_FUNCTION_ARGUMENT;
+
+  lenlen = quic_varint_encode(lenbuf, (uint64_t)vlen);
+  if(!lenlen)
+    return CURLE_BAD_FUNCTION_ARGUMENT;
+
+  result = curlx_dyn_addn(raw, (const char *)idbuf, idlen);
+  if(result)
+    return result;
+  result = curlx_dyn_addn(raw, (const char *)lenbuf, lenlen);
+  if(result)
+    return result;
+  if(vlen) {
+    result = curlx_dyn_addn(raw, (const char *)value, vlen);
+    if(result)
+      return result;
+  }
+
+  return CURLE_OK;
+}
+
+static CURLcode quic_dyn_add_u32be(struct dynbuf *db, uint32_t value)
+{
+  unsigned char b[4];
+  b[0] = (unsigned char)(value >> 24);
+  b[1] = (unsigned char)(value >> 16);
+  b[2] = (unsigned char)(value >> 8);
+  b[3] = (unsigned char)value;
+  return curlx_dyn_addn(db, (const char *)b, sizeof(b));
+}
+
+static CURLcode quic_parse_version_token(const char *tok,
+                                         bool allow_grease,
+                                         struct Curl_easy *data,
+                                         uint32_t *pver)
+{
+  unsigned long long v;
+  char *end = NULL;
+
+  if(allow_grease && curl_strequal(tok, "GREASE")) {
+    *pver = quic_version_grease(data);
+    return CURLE_OK;
+  }
+
+  v = strtoull(tok, &end, 0);
+  if(!*tok || (end && *end) || (v > 0xffffffffULL))
+    return CURLE_BAD_FUNCTION_ARGUMENT;
+
+  *pver = (uint32_t)v;
+  return CURLE_OK;
+}
+
+static CURLcode quic_append_version_information(struct dynbuf *raw,
+                                                uint64_t id,
+                                                const char *value_str,
+                                                struct Curl_easy *data)
+{
+  struct dynbuf vb;
+  CURLcode result = CURLE_OK;
+  char *tmp;
+  char *chosen_tok;
+  char *available_list;
+  char *p;
+  char *sep;
+  size_t available_count = 0;
+  uint32_t ver;
+
+  if(!value_str || !*value_str)
+    return CURLE_BAD_FUNCTION_ARGUMENT;
+
+  tmp = curlx_strdup(value_str);
+  if(!tmp)
+    return CURLE_OUT_OF_MEMORY;
+
+  sep = strchr(tmp, '@');
+  if(!sep || !*tmp || !*(sep + 1)) {
+    curlx_free(tmp);
+    return CURLE_BAD_FUNCTION_ARGUMENT;
+  }
+  *sep = '\0';
+  chosen_tok = tmp;
+  available_list = sep + 1;
+
+  curlx_dyn_init(&vb, 64);
+  result = quic_parse_version_token(chosen_tok, FALSE, data, &ver);
+  if(result)
+    goto out;
+  result = quic_dyn_add_u32be(&vb, ver);
+  if(result)
+    goto out;
+
+  p = available_list;
+  while(*p) {
+    char *comma = strchr(p, ',');
+    if(comma)
+      *comma = '\0';
+    result = quic_parse_version_token(p, TRUE, data, &ver);
+    if(result)
+      goto out;
+    result = quic_dyn_add_u32be(&vb, ver);
+    if(result)
+      goto out;
+    ++available_count;
+    if(!comma)
+      break;
+    if(!*(comma + 1)) {
+      result = CURLE_BAD_FUNCTION_ARGUMENT;
+      goto out;
+    }
+    p = comma + 1;
+  }
+
+  if(!available_count) {
+    result = CURLE_BAD_FUNCTION_ARGUMENT;
+    goto out;
+  }
+
+  result = quic_raw_append_param_bytes(raw, id,
+                                       (const uint8_t *)curlx_dyn_ptr(&vb),
+                                       curlx_dyn_len(&vb));
+
+out:
+  curlx_free(tmp);
+  curlx_dyn_free(&vb);
+  return result;
+}
+
+static CURLcode quic_transport_params_from_string(ngtcp2_transport_params *t,
+                                                  struct dynbuf *raw,
+                                                  const ngtcp2_cid *scid,
+                                                  struct Curl_easy *data)
+{
+  const char *params = CURL_EASY_STR(data, STRING_QUIC_TRANSPORT_PARAMETERS);
+  bool permute = Curl_ssl_http3_permute_extensions(data);
+  char *tmp;
+  char *p;
+  char **tokens = NULL;
+  size_t ntokens = 0;
+  size_t talloc = 0;
+  size_t i;
+  char *setting;
+  CURLcode result = CURLE_OK;
+
+  if(!params || !*params)
+    return CURLE_OK;
+
+  tmp = curlx_strdup(params);
+  if(!tmp)
+    return CURLE_OUT_OF_MEMORY;
+
+  p = tmp;
+  while(*p) {
+    char **newtokens;
+    size_t newalloc;
+
+    while(*p == ';')
+      ++p;
+    if(!*p)
+      break;
+
+    if(ntokens == talloc) {
+      newalloc = talloc ? (talloc * 2) : 8;
+      newtokens = curlx_realloc(tokens, newalloc * sizeof(*tokens));
+      if(!newtokens) {
+        result = CURLE_OUT_OF_MEMORY;
+        goto out;
+      }
+      tokens = newtokens;
+      talloc = newalloc;
+    }
+
+    tokens[ntokens++] = p;
+    while(*p && (*p != ';'))
+      ++p;
+    if(*p) {
+      *p = '\0';
+      ++p;
+    }
+  }
+
+  if(permute && (ntokens > 1)) {
+    result = quic_permute_token_order(tokens, ntokens, data);
+    if(result)
+      goto out;
+  }
+
+  for(i = 0; i < ntokens; ++i) {
+    char *colon;
+    char *value_str = NULL;
+    char *end = NULL;
+    uint64_t id;
+    uint64_t value = 0;
+    bool has_value = FALSE;
+    bool value_is_auto = FALSE;
+    bool value_is_empty_initial_scid = FALSE;
+    bool value_is_initial_rtt_auto = FALSE;
+    bool value_is_hex_bytes = FALSE;
+
+    setting = tokens[i];
+    colon = strchr(setting, ':');
+
+    if(curl_strequal(setting, "GREASE")) {
+      unsigned char grease_value[QUIC_TP_GREASE_VALUE_MAXLEN];
+      size_t grease_vlen;
+
+      result = quic_generate_grease_tp(data, &id, grease_value,
+                                        &grease_vlen);
+      if(result)
+        goto out;
+      result = quic_raw_append_param_bytes(raw, id, grease_value,
+                                            grease_vlen);
+      if(result)
+        goto out;
+      continue;
+    }
+
+    if(colon) {
+      *colon = '\0';
+      has_value = TRUE;
+      value_str = colon + 1;
+    }
+
+    id = strtoull(setting, &end, 10);
+    if(!*setting || (end && *end)) {
+      result = CURLE_BAD_FUNCTION_ARGUMENT;
+      goto out;
+    }
+    if(has_value) {
+      if(id == QUIC_TP_INITIAL_SOURCE_CONNECTION_ID &&
+         curl_strequal(value_str, "AUTO"))
+        value_is_auto = TRUE;
+      else if(id == QUIC_TP_INITIAL_SOURCE_CONNECTION_ID && !*value_str)
+        value_is_empty_initial_scid = TRUE;
+      else if(id == QUIC_TP_INITIAL_RTT &&
+              (curl_strequal(value_str, "AUTO") ||
+               curl_strequal(value_str, "RANDOM")))
+        value_is_initial_rtt_auto = TRUE;
+      else if(id == QUIC_TP_VERSION_INFORMATION || id == QUIC_TP_VERSION_INFORMATION_DRAFT) {
+        /* Parsed by dedicated handler below. */
+      }
+      else if(value_str[0] == '0' && (value_str[1] == 'x' ||
+                                       value_str[1] == 'X'))
+        value_is_hex_bytes = TRUE;
+      else {
+        value = strtoull(value_str, &end, 10);
+        if(!*value_str || (end && *end)) {
+          result = CURLE_BAD_FUNCTION_ARGUMENT;
+          goto out;
+        }
+      }
+    }
+
+    if(has_value && (id == QUIC_TP_VERSION_INFORMATION || id == QUIC_TP_VERSION_INFORMATION_DRAFT)) {
+      result = quic_append_version_information(raw, id, value_str, data);
+      if(result)
+        goto out;
+      continue;
+    }
+    if(id == QUIC_TP_GOOGLE_VERSION) {
+      unsigned char ver[4];
+
+      if(!has_value || (value > UINT_MAX)) {
+        failf(data, "QUIC transport param %" PRIu64
+              " requires a 32-bit version value", (uint64_t)id);
+        result = CURLE_BAD_FUNCTION_ARGUMENT;
+        goto out;
+      }
+      ver[0] = (unsigned char)(value >> 24);
+      ver[1] = (unsigned char)(value >> 16);
+      ver[2] = (unsigned char)(value >> 8);
+      ver[3] = (unsigned char)value;
+      result = quic_apply_transport_param(t, id, value, has_value, data);
+      if(result)
+        goto out;
+      result = quic_raw_append_param_bytes(raw, id, ver, sizeof(ver));
+      if(result)
+        goto out;
+      continue;
+    }
+
+    if(value_is_auto) {
+      if(!scid) {
+        failf(data, "QUIC transport param 15:AUTO has no local SCID pointer");
+        result = CURLE_BAD_FUNCTION_ARGUMENT;
+        goto out;
+      }
+      result = quic_raw_append_param_bytes(raw, id,
+                                           (const uint8_t *)scid->data,
+                                           scid->datalen);
+      if(result)
+        goto out;
+      continue;
+    }
+    if(value_is_empty_initial_scid) {
+      result = quic_raw_append_param_bytes(raw, id, NULL, 0);
+      if(result)
+        goto out;
+      continue;
+    }
+    if(value_is_hex_bytes) {
+      const char *hex = value_str + 2; /* skip "0x" */
+      size_t hex_len = strlen(hex);
+      size_t byte_len;
+      unsigned char *bytes;
+      size_t j;
+
+      if((hex_len == 0) || (hex_len % 2 != 0)) {
+        failf(data, "QUIC transport param %" PRIu64
+              " has invalid hex value", (uint64_t)id);
+        result = CURLE_BAD_FUNCTION_ARGUMENT;
+        goto out;
+      }
+      byte_len = hex_len / 2;
+      bytes = curlx_malloc(byte_len);
+      if(!bytes) {
+        result = CURLE_OUT_OF_MEMORY;
+        goto out;
+      }
+      for(j = 0; j < byte_len; j++) {
+        unsigned int byte_val;
+        if(sscanf(hex + 2 * j, "%2x", &byte_val) != 1) {
+          curlx_free(bytes);
+          failf(data, "QUIC transport param %" PRIu64
+                " has invalid hex value", (uint64_t)id);
+          result = CURLE_BAD_FUNCTION_ARGUMENT;
+          goto out;
+        }
+        bytes[j] = (unsigned char)byte_val;
+      }
+      result = quic_raw_append_param_bytes(raw, id, bytes, byte_len);
+      curlx_free(bytes);
+      if(result)
+        goto out;
+      continue;
+    }
+    if(value_is_initial_rtt_auto)
+      value = quic_initial_rtt_auto_us(data);
+
+    if(id > QUIC_VARINT_MAX || (has_value && value > QUIC_VARINT_MAX)) {
+      failf(data, "QUIC transport param value exceeds varint range");
+      result = CURLE_BAD_FUNCTION_ARGUMENT;
+      goto out;
+    }
+
+    result = quic_apply_transport_param(t, id, value, has_value, data);
+    if(result)
+      goto out;
+    result = quic_raw_append_param(raw, id, value, has_value);
+    if(result)
+      goto out;
+  }
+
+out:
+  curlx_free(tokens);
+  curlx_free(tmp);
+  return result;
+}
+
+
+static CURLcode quic_settings(struct cf_ngtcp2_ctx *ctx,
+                              struct Curl_easy *data,
+                              struct cf_ngtcp2_io_ctx *pktx)
 {
   ngtcp2_settings *s = &ctx->settings;
   ngtcp2_transport_params *t = &ctx->transport_params;
+  CURLcode result;
 
   ngtcp2_settings_default(s);
   ngtcp2_transport_params_default(t);
@@ -247,6 +973,18 @@ static void quic_settings(struct cf_ngtcp2_ctx *ctx,
   s->max_window = H3_CONN_WINDOW_SIZE_MAX;
   s->max_stream_window = 0; /* disable ngtcp2 auto-tuning of window */
   s->no_pmtud = FALSE;
+  if(data->set.quic_initial_packet_number < 0) {
+    unsigned char r[2];
+
+    result = Curl_rand(data, r, sizeof(r));
+    if(result)
+      return result;
+    /* Match Neqo's biased random distribution in the range 1..1024. */
+    s->initial_pkt_num = (uint32_t)(r[0] & 0x1f) +
+      ((uint32_t)(r[1] > 224 ? r[1] - 224 : 0) << 5) + 1;
+  }
+  else
+    s->initial_pkt_num = (uint32_t)data->set.quic_initial_packet_number;
 #ifdef NGTCP2_SETTINGS_V3
   /* try ten times the ngtcp2 defaults here for problems with Caddy */
   s->glitch_ratelim_burst = 1000 * 10;
@@ -262,6 +1000,10 @@ static void quic_settings(struct cf_ngtcp2_ctx *ctx,
   if(ctx->qlogfd != -1) {
     s->qlog_write = qlog_callback;
   }
+  curlx_dyn_reset(&ctx->tp_raw);
+  result = quic_transport_params_from_string(t, &ctx->tp_raw, &ctx->scid,
+                                             data);
+  return result;
 }
 
 #if defined(_MSC_VER) && defined(_DLL)
@@ -992,31 +1734,60 @@ static CURLcode cf_connect_start(struct Curl_cfilter *cf,
   int rc;
   int rv;
   CURLcode result;
+  const char *cid_profile = CURL_EASY_STR(data, STRING_QUIC_CID_LENGTH);
+  size_t dcidlen = NGTCP2_MAX_CIDLEN;
+  size_t scidlen = NGTCP2_MAX_CIDLEN;
   const struct Curl_sockaddr_ex *sockaddr = NULL;
   int qfd;
-  static const struct alpn_spec ALPN_SPEC_H3 = { { "h3", "h3-29" }, 2 };
+  static const struct alpn_spec ALPN_SPEC_H3 = { { "h3" }, 1 };
 
   DEBUGASSERT(ctx->initialized);
-  ctx->dcid.datalen = NGTCP2_MAX_CIDLEN;
-  result = Curl_rand(data, ctx->dcid.data, NGTCP2_MAX_CIDLEN);
+  if(cid_profile) {
+    if(!strcmp(cid_profile, "webkit")) {
+      dcidlen = 8;
+      scidlen = 0;
+    }
+    else if(!strcmp(cid_profile, "firefox")) {
+      unsigned char v;
+
+      result = Curl_rand(data, &v, sizeof(v));
+      if(result)
+        return result;
+      dcidlen = 5 + (v & (v >> 4));
+      if(dcidlen < 8)
+        dcidlen = 8;
+      scidlen = 3;
+    }
+  }
+
+  ctx->dcid.datalen = dcidlen;
+  result = Curl_rand(data, ctx->dcid.data, ctx->dcid.datalen);
   if(result)
     return result;
 
-  ctx->scid.datalen = NGTCP2_MAX_CIDLEN;
-  result = Curl_rand(data, ctx->scid.data, NGTCP2_MAX_CIDLEN);
-  if(result)
-    return result;
+  ctx->scid.datalen = scidlen;
+  if(!cid_profile && quic_has_empty_initial_scid(
+       CURL_EASY_STR(data, STRING_QUIC_TRANSPORT_PARAMETERS)))
+    ctx->scid.datalen = 0;
+  if(ctx->scid.datalen) {
+    result = Curl_rand(data, ctx->scid.data, ctx->scid.datalen);
+    if(result)
+      return result;
+  }
 
-  (void)Curl_qlogdir(data, ctx->scid.data, NGTCP2_MAX_CIDLEN, &qfd);
+  (void)Curl_qlogdir(data, ctx->scid.data, ctx->scid.datalen, &qfd);
   ctx->qlogfd = qfd; /* -1 if failure above */
-  quic_settings(ctx, data, pktx);
+  result = quic_settings(ctx, data, pktx);
+  if(result)
+    return result;
 
   result = Curl_vquic_ctx_init(data, &ctx->q);
   if(result)
     return result;
 
   /* Query socket and remote address from sub-chain */
-  if(Curl_cf_socket_peek(cf->next, data, &ctx->q.sockfd, &sockaddr, NULL)) {
+  if(cf_ngtcp2_peek_socket(cf->next, data, &ctx->q.sockfd,
+                           &sockaddr, NULL)) {
     /* No direct socket - must be tunneled QUIC (CONNECT-UDP through proxy) */
     ctx->q.sockfd = CURL_SOCKET_BAD;
   }
@@ -1035,6 +1806,7 @@ static CURLcode cf_connect_start(struct Curl_cfilter *cf,
     ngtcp2_addr_init(&ctx->connected_path.remote,
                      &sockaddr->curl_sa_addr, (socklen_t)sockaddr->addrlen);
   }
+
   else {
     /* Tunneled QUIC (e.g. CONNECT-UDP): get remote address
        from the connected filter below */
@@ -1080,7 +1852,20 @@ static CURLcode cf_connect_start(struct Curl_cfilter *cf,
   ctx->conn_ref.get_conn = get_conn;
   ctx->conn_ref.user_data = cf;
 
-  result = Curl_vquic_tls_init(&ctx->tls, cf, data,
+  if(curlx_dyn_len(&ctx->tp_raw)) {
+    ngtcp2_transport_params_raw raw = {
+      (const uint8_t *)curlx_dyn_ptr(&ctx->tp_raw),
+      curlx_dyn_len(&ctx->tp_raw)
+    };
+    rc = ngtcp2_conn_set_local_transport_params_raw(ctx->qconn, &raw);
+    if(rc) {
+      failf(data, "error setting local QUIC transport params: %s",
+            ngtcp2_strerror(rc));
+      return CURLE_QUIC_CONNECT_ERROR;
+    }
+  }
+
+  result = Curl_vquic_tls_init(&ctx->tls, cf, data, &ctx->call_data,
                                &ctx->ssl_peer, &ALPN_SPEC_H3,
                                cf_ngtcp2_tls_ctx_setup, &ctx->tls,
                                &ctx->conn_ref,
@@ -1227,7 +2012,7 @@ out:
       /* Direct UDP socket - get IP info for error reporting */
       struct ip_quadruple ip;
 
-      if(!Curl_cf_socket_peek(cf->next, data, NULL, NULL, &ip))
+      if(!cf_ngtcp2_peek_socket(cf->next, data, NULL, NULL, &ip))
         infof(data, "QUIC connect to %s port %u failed: %s",
               ip.remote_ip, ip.remote_port, curl_easy_strerror(result));
     }
@@ -1859,14 +2644,34 @@ CURLcode Curl_cf_ngtcp2_cmn_set_expiry(struct Curl_cfilter *cf,
   return CURLE_OK;
 }
 
+static ngtcp2_duration
+cf_ngtcp2_effective_idle_timeout(struct cf_ngtcp2_ctx *ctx)
+{
+  const ngtcp2_transport_params *lp;
+  const ngtcp2_transport_params *rp;
+  ngtcp2_duration timeout = 0;
+
+  if(!ctx->qconn)
+    return 0;
+
+  lp = ngtcp2_conn_get_local_transport_params(ctx->qconn);
+  rp = ngtcp2_conn_get_remote_transport_params(ctx->qconn);
+  if(lp)
+    timeout = lp->max_idle_timeout;
+  if(rp && rp->max_idle_timeout &&
+     (!timeout || rp->max_idle_timeout < timeout))
+    timeout = rp->max_idle_timeout;
+  return timeout;
+}
+
 static void cf_ngtcp2_setup_keep_alive(struct Curl_cfilter *cf,
                                        struct Curl_easy *data)
 {
   struct cf_ngtcp2_ctx *ctx = cf->ctx;
-  const ngtcp2_transport_params *rp;
-  /* Peer should have sent us its transport parameters. If it
-   * announces a positive `max_idle_timeout` it closes the
-   * connection when it does not hear from us for that time.
+  ngtcp2_duration idle_timeout;
+
+  /* If either endpoint announces a positive `max_idle_timeout`, the
+   * connection closes when it remains idle for the effective timeout.
    *
    * Some servers use this as a keep-alive timer at a rather low
    * value. We are doing HTTP/3 here and waiting for the response
@@ -1876,10 +2681,10 @@ static void cf_ngtcp2_setup_keep_alive(struct Curl_cfilter *cf,
   if(!ctx->qconn)
     return;
 
-  rp = ngtcp2_conn_get_remote_transport_params(ctx->qconn);
-  if(!rp || !rp->max_idle_timeout) {
+  idle_timeout = cf_ngtcp2_effective_idle_timeout(ctx);
+  if(!idle_timeout) {
     ngtcp2_conn_set_keep_alive_timeout(ctx->qconn, UINT64_MAX);
-    CURL_TRC_CF(data, cf, "no peer idle timeout, unset keep-alive");
+    CURL_TRC_CF(data, cf, "no idle timeout, unset keep-alive");
   }
   else if(!Curl_u32_ptrset_count(&ctx->streams)) {
     ngtcp2_conn_set_keep_alive_timeout(ctx->qconn, UINT64_MAX);
@@ -1887,11 +2692,11 @@ static void cf_ngtcp2_setup_keep_alive(struct Curl_cfilter *cf,
   }
   else {
     ngtcp2_duration keep_ns;
-    keep_ns = (rp->max_idle_timeout > 1) ? (rp->max_idle_timeout / 2) : 1;
+    keep_ns = (idle_timeout > 1) ? (idle_timeout / 2) : 1;
     ngtcp2_conn_set_keep_alive_timeout(ctx->qconn, keep_ns);
-    CURL_TRC_CF(data, cf, "peer idle timeout is %" PRIu64 "ms, "
+    CURL_TRC_CF(data, cf, "effective idle timeout is %" PRIu64 "ms, "
                 "set keep-alive to %" PRIu64 " ms.",
-                (rp->max_idle_timeout / NGTCP2_MILLISECONDS),
+                (idle_timeout / NGTCP2_MILLISECONDS),
                 (keep_ns / NGTCP2_MILLISECONDS));
   }
 }
@@ -1984,7 +2789,10 @@ bool Curl_cf_ngtcp2_cmn_conn_is_alive(struct Curl_cfilter *cf,
 {
   struct cf_ngtcp2_ctx *ctx = cf->ctx;
   bool alive = FALSE;
-  const ngtcp2_transport_params *rp;
+  bool expiry_handled = FALSE;
+  ngtcp2_tstamp expiry;
+  ngtcp2_tstamp now_ts;
+  const struct curltime *now;
   struct cf_call_data save;
 
   CF_DATA_SAVE(save, cf, data);
@@ -1992,18 +2800,19 @@ bool Curl_cf_ngtcp2_cmn_conn_is_alive(struct Curl_cfilter *cf,
   if(!ctx->qconn || ctx->shutdown_started)
     goto out;
 
-  /* We do not announce a max idle timeout, but when the peer does
-   * it closes the connection when it expires. */
-  rp = ngtcp2_conn_get_remote_transport_params(ctx->qconn);
-  if(rp && rp->max_idle_timeout) {
-    timediff_t idletime_ms =
-      curlx_ptimediff_ms(Curl_pgrs_now(data), &ctx->q.last_io);
-    if(idletime_ms > 0) {
-      uint64_t max_idle_ms =
-        (uint64_t)(rp->max_idle_timeout / NGTCP2_MILLISECONDS);
-      if((uint64_t)idletime_ms > max_idle_ms)
-        goto out;
+  /* Let ngtcp2 apply all timer rules, including the negotiated idle timeout,
+   * the 3 PTO minimum and the QUIC idle timer reset rules. */
+  now = Curl_pgrs_now(data);
+  now_ts = ((ngtcp2_tstamp)now->tv_sec * NGTCP2_SECONDS) +
+           ((ngtcp2_tstamp)now->tv_usec * NGTCP2_MICROSECONDS);
+  expiry = ngtcp2_conn_get_expiry(ctx->qconn);
+  if((expiry != UINT64_MAX) && (expiry <= now_ts)) {
+    int rv = ngtcp2_conn_handle_expiry(ctx->qconn, now_ts);
+    if(rv) {
+      Curl_cf_ngtcp2_cmn_err_set(cf, data, rv);
+      goto out;
     }
+    expiry_handled = TRUE;
   }
 
   if(!cf->next || !cf->next->cft->is_alive(cf->next, data, input_pending))
@@ -2018,6 +2827,11 @@ bool Curl_cf_ngtcp2_cmn_conn_is_alive(struct Curl_cfilter *cf,
     *input_pending = FALSE;
     result = Curl_cf_ngtcp2_progress_ingress(cf, data, NULL);
     CURL_TRC_CF(data, cf, "is_alive, progress ingress -> %d", (int)result);
+    alive = result ? FALSE : TRUE;
+  }
+  if(alive && expiry_handled) {
+    CURLcode result = Curl_cf_ngtcp2_progress_egress(cf, data, NULL);
+    CURL_TRC_CF(data, cf, "is_alive, progress egress -> %d", (int)result);
     alive = result ? FALSE : TRUE;
   }
 

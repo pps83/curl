@@ -178,12 +178,13 @@ static CURLcode cf_h3_proxy_ctx_init(struct cf_h3_proxy_ctx *ctx,
                                      struct Curl_peer *origin,
                                      struct Curl_peer *peer,
                                      struct ssl_filter_config *sslc,
+                                     struct connectdata *conn,
                                      struct Curl_peer *tunnel_peer,
                                      uint8_t tunnel_transport)
 {
   CURLcode result;
   result = Curl_cf_ngtcp2_ctx_init(&ctx->ngtcp2_ctx, origin, peer,
-                                   sslc, cf_ngtcp2_proxy_h3_init);
+                                   sslc, conn, cf_ngtcp2_proxy_h3_init);
   if(!result)
     result = h3_tunnel_stream_init(&ctx->tunnel, tunnel_peer,
                                    TRNSPRT_IS_DGRAM(tunnel_transport));
@@ -1245,7 +1246,7 @@ CURLcode Curl_cf_ngtcp2_proxy_create(struct Curl_cfilter **pcf,
     goto out;
   }
   result = cf_h3_proxy_ctx_init(ctx, origin, peer, &conn->proxy_ssl_config,
-                                tunnel_peer, tunnel_transport);
+                                conn, tunnel_peer, tunnel_transport);
   if(result)
     goto out;
 
@@ -1291,7 +1292,7 @@ CURLcode Curl_cf_ngtcp2_proxy_insert_after(struct Curl_cfilter *cf_at,
     goto out;
   result = cf_h3_proxy_ctx_init(ctx, origin, peer,
                                 &cf_at->conn->proxy_ssl_config,
-                                tunnel_peer, tunnel_transport);
+                                cf_at->conn, tunnel_peer, tunnel_transport);
   if(result)
     goto out;
 

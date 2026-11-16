@@ -52,6 +52,12 @@ struct ssl_filter_config {
   struct curl_blob *issuercert_blob;
   struct curl_blob *key_blob;
   char *curves;          /* list of curves to use */
+  char *tls_extension_order; /* TLS extension order to use */
+  char *cert_compression; /* certificate compression algorithms */
+  char *http3_curves;    /* HTTP/3 list of curves to use */
+  char *http3_signature_algorithms; /* HTTP/3 signature algorithms */
+  char *http3_tls_extension_order; /* HTTP/3 TLS extension order */
+  char *trust_anchors;    /* comma-separated trust anchor relative OIDs */
   uint32_t version_max; /* max supported version the client wants to use */
   uint8_t ssl_options;  /* the CURLOPT_SSL_OPTIONS bitmask */
   uint8_t version;    /* what version the client wants to use */
@@ -63,6 +69,8 @@ struct ssl_filter_config {
   BIT(verifystatus);     /* set TRUE if certificate status must be checked */
   BIT(native_ca_store);  /* use the native CA store of operating system */
   BIT(cache_session);    /* cache session or not */
+  BIT(enable_ticket);    /* enable the TLS session ticket extension */
+  BIT(http3_ssl_permute_extensions); /* HTTP/3 TLS extension permutation */
   BIT(deep_copy);        /* members are deep copies, eg. owned here */
   BIT(earlydata);        /* use TLS 1.3 early data */
   BIT(auto_client_cert);   /* automatically locate and use a client
@@ -101,6 +109,20 @@ CURLcode Curl_ssl_filter_config_tmp_init(
   struct Curl_easy *data, struct Curl_peer *origin,
   struct ssl_filter_config *ssl_origin,
   struct ssl_filter_config *ssl_proxy);
+
+/* Use the effective connection scheme for WebSocket TLS overrides. */
+CURLcode Curl_ssl_filter_config_tmp_init_conn(
+  struct Curl_easy *data, struct connectdata *conn,
+  struct ssl_filter_config *ssl_origin,
+  struct ssl_filter_config *ssl_proxy);
+
+const char *Curl_ssl_config_get_curves(
+  const struct ssl_filter_config *sslc, uint8_t transport);
+const char *Curl_ssl_config_get_signature_algorithms(
+  const struct ssl_filter_config *sslc, uint8_t transport);
+const char *Curl_ssl_config_get_tls_extension_order(
+  const struct ssl_filter_config *sslc, uint8_t transport);
+bool Curl_ssl_http3_permute_extensions(const struct Curl_easy *data);
 
 /* Clone the given filter configs into the connection. */
 CURLcode Curl_ssl_conn_config_clone(struct ssl_filter_config *ssl_config,

@@ -115,6 +115,7 @@ bool Curl_secure_context(struct Curl_easy *data, const char *host);
 #define COOKIE_NOEXPIRE   (1<<1) /* skip remove_expired() */
 #define COOKIE_SECURE     (1<<2) /* connection is over secure origin */
 #define COOKIE_NOPSL      (1<<3) /* skip PSL check */
+#define COOKIE_RECORD     (1<<4) /* record accepted server cookie */
 #define COOKIE_NOSESSION  (1<<6) /* drop session cookies */
 
 CURLcode Curl_cookie_add(struct Curl_easy *data,

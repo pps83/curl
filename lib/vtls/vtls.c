@@ -120,6 +120,20 @@ static const struct alpn_spec *alpn_get_spec(http_majors wanted,
 #endif
   return &ALPN_SPEC_H11;
 }
+
+static const struct alpn_spec *alps_get_spec(http_majors wanted,
+                                             bool use_alps)
+{
+  if(!use_alps)
+    return NULL;
+#ifdef USE_HTTP2
+  if(wanted & CURL_HTTP_V2x)
+    return &ALPN_SPEC_H2;
+#else
+  (void)wanted;
+#endif
+  return NULL;
+}
 #endif /* !CURL_DISABLE_HTTP || !CURL_DISABLE_PROXY */
 #endif /* USE_SSL */
 
@@ -186,7 +200,8 @@ static bool ssl_prefs_check(struct Curl_cfilter *cf,
 }
 
 static struct ssl_connect_data *cf_ctx_new(struct Curl_easy *data,
-                                           const struct alpn_spec *alpn)
+                                           const struct alpn_spec *alpn,
+                                           const struct alpn_spec *alps)
 {
   struct ssl_connect_data *ctx;
 
@@ -197,6 +212,7 @@ static struct ssl_connect_data *cf_ctx_new(struct Curl_easy *data,
 
   ctx->ssl_impl = Curl_ssl;
   ctx->alpn = alpn;
+  ctx->alps = alps;
   Curl_bufq_init2(&ctx->earlydata, CURL_SSL_EARLY_MAX, 1, BUFQ_OPT_NO_SPARES);
   ctx->backend = curlx_calloc(1, ctx->ssl_impl->sizeof_ssl_backend_data);
   if(!ctx->backend) {
@@ -899,7 +915,8 @@ CURLcode Curl_ssl_peer_init(struct ssl_peer *ssl_peer,
                             struct Curl_peer *peer,
                             struct ssl_filter_config *sslc,
                             const char *tls_id,
-                            uint8_t transport)
+                            uint8_t transport,
+                            struct connectdata *conn)
 {
   CURLcode result = CURLE_OUT_OF_MEMORY;
 
@@ -931,8 +948,8 @@ CURLcode Curl_ssl_peer_init(struct ssl_peer *ssl_peer,
     }
   }
 
-  result = Curl_ssl_peer_key_make(ssl_peer, sslc, tls_id,
-                                  &ssl_peer->scache_key);
+  result = Curl_ssl_peer_key_make_conn(ssl_peer, sslc, conn, tls_id,
+                                       &ssl_peer->scache_key);
 
 out:
   if(result)
@@ -1360,12 +1377,14 @@ static CURLcode cf_ssl_create(struct Curl_cfilter **pcf,
   (void)conn;
   /* We only support ALPN for HTTP so far. */
   DEBUGASSERT(!conn->bits.tls_enable_alpn);
-  ctx = cf_ctx_new(data, NULL);
+  ctx = cf_ctx_new(data, NULL, NULL);
 #else
   ctx = cf_ctx_new(data, alpn_get_spec(data->state.http_neg.wanted,
                                        data->state.http_neg.preferred,
                                        (bool)data->state.http_neg.only_10,
-                                       (bool)conn->bits.tls_enable_alpn));
+                                       (bool)conn->bits.tls_enable_alpn),
+                   alps_get_spec(data->state.http_neg.wanted,
+                                 (bool)conn->bits.tls_enable_alps));
 #endif
   if(!ctx) {
     result = CURLE_OUT_OF_MEMORY;
@@ -1390,7 +1409,7 @@ static CURLcode cf_ssl_peer_init(struct Curl_cfilter *cf,
   char tls_id[80];
   connssl->ssl_impl->version(tls_id, sizeof(tls_id) - 1);
   return Curl_ssl_peer_init(&connssl->peer, origin, peer, sslc,
-                            tls_id, TRNSPRT_TCP);
+                            tls_id, TRNSPRT_TCP, cf->conn);
 }
 
 CURLcode Curl_ssl_cfilter_add(struct Curl_easy *data,
@@ -1451,9 +1470,9 @@ static CURLcode cf_ssl_proxy_create(struct Curl_cfilter **pcf,
   CURLcode result;
   /* ALPN is default, but if user explicitly disables it, obey */
   bool use_alpn = (bool)data->set.ssl_enable_alpn;
+  bool use_alps = (bool)conn->bits.tls_enable_alps;
   http_majors wanted = CURL_HTTP_V1x;
 
-  (void)conn;
 #ifdef USE_HTTP2
   if(conn->http_proxy.proxytype == CURLPROXY_HTTPS2) {
     use_alpn = TRUE;
@@ -1461,7 +1480,8 @@ static CURLcode cf_ssl_proxy_create(struct Curl_cfilter **pcf,
   }
 #endif
 
-  ctx = cf_ctx_new(data, alpn_get_spec(wanted, 0, FALSE, use_alpn));
+  ctx = cf_ctx_new(data, alpn_get_spec(wanted, 0, FALSE, use_alpn),
+                   alps_get_spec(wanted, use_alps));
   if(!ctx) {
     result = CURLE_OUT_OF_MEMORY;
     goto out;

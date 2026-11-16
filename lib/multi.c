@@ -263,7 +263,8 @@ struct Curl_multi *Curl_multi_handle(uint32_t xfer_table_size,
   Curl_cshutdn_init(&multi->cshutdn);
 
   multi->multiplexing = TRUE;
-  multi->max_concurrent_streams = 100;
+  /* curl-impersonate: Use 1000 concurrent streams like Chrome. */
+  multi->max_concurrent_streams = 1000;
 #ifdef ENABLE_WAKEUP
   multi->wakeup_pair[0] = CURL_SOCKET_BAD;
   multi->wakeup_pair[1] = CURL_SOCKET_BAD;

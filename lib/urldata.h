@@ -182,6 +182,7 @@ struct ConnectBits {
   BIT(connect_only);
 #ifndef CURL_DISABLE_PROXY
   BIT(origin_is_proxy);  /* if set, the connection's origin is a proxy */
+  BIT(proxy_credential_no_reuse); /* partition TLS sessions by proxy creds */
   BIT(socks5_authenticated); /* SOCKS5 authenticated on FIRSTSOCKET */
 #endif
   /* always modify bits.close with the connclose() and connkeep() macros! */
@@ -210,6 +211,14 @@ struct ConnectBits {
   BIT(multiplex); /* connection is multiplexed */
   BIT(tcp_fastopen); /* use TCP Fast Open */
   BIT(tls_enable_alpn); /* TLS ALPN extension? */
+  BIT(tls_enable_alps); /* TLS ALPS extension? */
+  BIT(tls_enable_ticket); /* TLS session ticket extension? */
+  BIT(tls_permute_extensions); /* TLS extension permutations */
+  BIT(tls_use_new_alps_codepoint); /* TLS ALPS new codepoint */
+  BIT(tls_grease);  /* TLS grease? */
+#ifndef CURL_DISABLE_DOH
+  BIT(doh);
+#endif
   BIT(sock_accepted); /* TRUE if the SECONDARYSOCKET was created with
                          accept() */
   BIT(parallel_connect); /* set TRUE when a parallel connect attempt has
@@ -301,6 +310,13 @@ struct connectdata {
   struct Curl_cfilter *cfilter[2]; /* connection filters */
   Curl_recv *recv[2];
   Curl_send *send[2];
+#if defined(USE_OPENSSL) && defined(HAVE_SSL_SET1_ECH_CONFIG_LIST)
+  /* Preserved while the setup filter recreates the connection chain. */
+  unsigned char *ech_retry_configs[2];
+  size_t ech_retry_configs_len[2];
+  uint8_t ech_retry_pending[2];
+  uint8_t ech_retry_attempted[2];
+#endif
   curl_socket_t sock[2];
 
 #define CONN_SOCK_IDX_VALID(i)    (((i) >= 0) && ((i) < 2))
@@ -404,6 +420,10 @@ struct PureInfo {
   curl_off_t numconnects; /* how many new connections libcurl created */
   char *contenttype; /* the content type of the object */
   char *wouldredirect; /* URL this would have been redirected to if asked to */
+  struct curl_slist *cookiechanges; /* accepted Set-Cookie mutations */
+  struct curl_slist *cookiechanges_tail; /* last cookie change */
+  struct curl_slist *redirect_history; /* followed redirects */
+  struct curl_slist *redirect_history_tail; /* last followed redirect */
   char *effective_url; /* when needed */
   curl_off_t retry_after; /* info from Retry-After: header */
   const char *conn_scheme;
@@ -600,6 +620,21 @@ struct UrlState {
                                     curl_easy_setopt(COOKIEFILE) calls */
 #endif
 
+  /*
+   * curl-impersonate:
+   * List of "base" headers set by CURLOPT_HTTPBASEHEADER.
+   */
+  struct curl_slist *base_headers;
+  /* Owned HTTP/3 defaults from the impersonation profile. */
+  struct curl_slist *http3_base_headers;
+  /*
+   * curl-impersonate:
+   * Dynamically-constructed list of HTTP headers.
+   * This list is a merge of the default HTTP headers needed to impersonate a
+   * browser, together with any user-supplied headers.
+   */
+  struct curl_slist *merged_headers;
+
 #ifdef CURLVERBOSE
   struct curl_trc_feat *feat; /* opt. trace feature transfer is part of */
 #endif
@@ -631,6 +666,7 @@ struct UrlState {
 
 #if defined(USE_HTTP2) || defined(USE_HTTP3)
   int weight; /* shallow copy of data->set */
+  BIT(stream_exclusive); /* HTTP/2 dependency is exclusive */
 #endif
   uint16_t followlocation; /* redirect counter */
   uint8_t retrycount; /* number of retries on a new connection, up to
@@ -706,6 +742,8 @@ enum dupstring {
   STRING_SSL_CRLFILE,     /* CRL file to check certificate */
   STRING_SSL_ISSUERCERT,  /* issuer cert file to check certificate */
   STRING_SERVICE_NAME,    /* Service name */
+  STRING_IMPERSONATE,     /* curl-impersonate */
+  STRING_FORM_BOUNDARY,   /* CURLOPT_FORM_BOUNDARY */
 #ifndef CURL_DISABLE_PROXY
   STRING_CERT_PROXY,      /* client certificate filename */
   STRING_CERT_TYPE_PROXY, /* format for certificate (default: PEM)*/
@@ -794,6 +832,7 @@ enum dupstring {
   STRING_DNS_LOCAL_IP6,
 #endif
   STRING_SSL_EC_CURVES,
+  STRING_HTTP3_SSL_EC_CURVES,
 #ifndef CURL_DISABLE_AWS
   STRING_AWS_SIGV4, /* Parameters for V4 signature */
 #endif
@@ -807,6 +846,23 @@ enum dupstring {
 #endif
   STRING_ECH_CONFIG,            /* CURLOPT_ECH_CONFIG */
   STRING_ECH_PUBLIC,            /* CURLOPT_ECH_PUBLIC */
+  STRING_HTTP3_SIG_HASH_ALGS,
+  STRING_SSL_CERT_COMPRESSION,
+  STRING_WS_SSL_CERT_COMPRESSION,
+  STRING_HTTP2_PSEUDO_HEADERS_ORDER,
+  STRING_HTTP2_SETTINGS,
+  STRING_HTTP2_STREAMS,
+  STRING_HTTP3_PSEUDO_HEADERS_ORDER,
+  STRING_HTTP3_SETTINGS,
+  STRING_QUIC_CID_LENGTH,
+  STRING_QUIC_TRANSPORT_PARAMETERS,
+  STRING_HTTPHEADER_ORDER,
+  STRING_HTTP3_HTTPHEADER_ORDER,
+  STRING_WS_HTTPHEADER_ORDER,
+  STRING_TLS_EXTENSION_ORDER,
+  STRING_HTTP3_TLS_EXTENSION_ORDER,
+  STRING_TLS_DELEGATED_CREDENTIALS,
+  STRING_TLS_TRUST_ANCHORS,
   STRING_SSL_SIGNATURE_ALGORITHMS, /* CURLOPT_SSL_SIGNATURE_ALGORITHMS */
 
   STRING_LAST /* not used, an end-of-list marker */
@@ -881,6 +937,8 @@ struct UserDefined {
                                 download */
   curl_off_t set_resume_from;  /* continue [ftp] transfer from here */
   struct curl_slist *headers; /* linked list of extra headers */
+  struct curl_slist *http3_headers; /* HTTP/3-specific extra headers */
+  struct curl_slist *ws_headers; /* WebSocket-specific extra headers */
   struct curl_httppost *httppost;  /* linked list of old POST data */
 #if !defined(CURL_DISABLE_MIME) || !defined(CURL_DISABLE_FORM_API)
   curl_mimepart *mimepostp;  /* MIME/POST data. */
@@ -1048,6 +1106,7 @@ struct UserDefined {
   BIT(sep_headers);     /* handle host and proxy headers separately */
 #ifndef CURL_DISABLE_COOKIES
   BIT(cookiesession);   /* new cookie session? */
+  BIT(split_cookies);   /* split cookies into one Cookie header per pair */
 #endif
   BIT(crlf);            /* convert crlf on ftp upload(?) */
 #ifdef USE_SSH
@@ -1064,6 +1123,7 @@ struct UserDefined {
   BIT(get_filetime);     /* get the time and get of the remote file */
 #ifndef CURL_DISABLE_PROXY
   BIT(tunnel_thru_httpproxy); /* use CONNECT through an HTTP proxy */
+  BIT(proxy_credential_no_reuse); /* no reuse of SSL sessions/connections via different proxy credentials */
 #endif
   BIT(prefer_ascii);     /* ASCII rather than binary */
   BIT(remote_append);    /* append, not overwrite, on upload */
@@ -1107,7 +1167,18 @@ struct UserDefined {
   BIT(sasl_ir);         /* Enable/disable SASL initial response */
   BIT(tcp_keepalive);  /* use TCP keepalives */
   BIT(tcp_fastopen);   /* use TCP Fast Open */
+  BIT(ssl_version_set); /* CURLOPT_SSLVERSION was explicitly set */
   BIT(ssl_enable_alpn);/* TLS ALPN extension? */
+  BIT(ssl_enable_alps);/* TLS ALPS extension? */
+  BIT(ssl_enable_ticket); /* TLS session ticket extension */
+  BIT(ws_disable_session_ticket); /* disable WebSocket TLS session ticket */
+  BIT(ssl_permute_extensions); /* TLS Permute extensions */
+  CURLhttp3sslpermute http3_ssl_permute_extensions;
+  BIT(tls_grease);  /* TLS grease? */
+  BIT(tls_key_usage_no_check);  /* TLS key_usage_check? */
+  BIT(tls_signed_cert_timestamps);  /* TLS signed cert timestamps? */
+  BIT(tls_status_request);  /* TLS status request */
+  BIT(tls_use_new_alps_codepoint); /* TLS use new alps codepoint */
   BIT(path_as_is);     /* allow dotdots? */
   BIT(pipewait);       /* wait for multiplex status before starting a new
                           connection */
@@ -1132,7 +1203,14 @@ struct UserDefined {
 #ifndef CURL_DISABLE_WEBSOCKETS
   BIT(ws_raw_mode);
   BIT(ws_no_auto_pong);
+  BIT(ws_permessage_deflate);
 #endif
+  int http2_window_update;
+  int tls_record_size_limit;
+  int tls_key_shares_limit;
+  long quic_initial_packet_number;
+  BIT(http2_no_priority);
+  BIT(stream_exclusive); /* HTTP/2 dependency is exclusive */
   BIT(post301); /* keep POSTs as POSTs after a 301 request */
   BIT(post302); /* keep POSTs as POSTs after a 302 request */
   BIT(post303); /* keep POSTs as POSTs after a 303 request */

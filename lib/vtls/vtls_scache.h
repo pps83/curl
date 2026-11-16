@@ -66,6 +66,12 @@ CURLcode Curl_ssl_peer_key_make(const struct ssl_peer *peer,
                                 const char *tls_id,
                                 char **ppeer_key);
 
+CURLcode Curl_ssl_peer_key_make_conn(const struct ssl_peer *peer,
+                                     struct ssl_filter_config *sslc,
+                                     const struct connectdata *conn,
+                                     const char *tls_id,
+                                     char **ppeer_key);
+
 /* Return if there is a session cache shall be used.
  * An SSL session might not be configured or not available for
  * "connect-only" transfers.
