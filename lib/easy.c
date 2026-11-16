@@ -726,7 +726,7 @@ CURLcode curl_easy_impersonate_customized(struct Curl_easy *data,
 static const struct impersonate_opts *binary_search(size_t size, const char *key)
 {
   int low = 0;
-  int high = size - 1;
+  int high = (int)size - 1;
 
   while(low <= high) {
     int mid = low + (high - low) / 2;

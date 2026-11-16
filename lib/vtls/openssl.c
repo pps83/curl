@@ -73,14 +73,14 @@
 #include <openssl/rsa.h>
 #include <openssl/bio.h>
 #include <openssl/pkcs12.h>
-#ifdef OPENSSL_IS_BORINGSSL
+#ifdef HAVE_BORINGSSL_LIKE
 #include <openssl/bytestring.h>
 #include <openssl/pool.h>
 #endif
 #include <openssl/tls1.h>
 #include <openssl/evp.h>
 
-#ifdef OPENSSL_IS_BORINGSSL
+#ifdef HAVE_BORINGSSL_LIKE
 #ifdef HAVE_LIBZ
 #include <zlib.h>
 #endif
@@ -187,14 +187,21 @@
 #ifdef HAVE_BORINGSSL_LIKE
 typedef size_t numcert_t;
 
-#if defined(OPENSSL_IS_BORINGSSL)
+#ifdef HAVE_BORINGSSL_LIKE
 #define HAVE_SSL_CTX_SET_VERIFY_ALGORITHM_PREFS
 
 /*
  * kMaxSignatureAlgorithmNameLen and kSignatureAlgorithmNames
  * Taken from BoringSSL, see ssl/ssl_privkey.cc
  * */
-static const size_t kMaxSignatureAlgorithmNameLen = 23;
+#define kMaxSignatureAlgorithmNameLen 23
+
+/* AWS-LC does not name the ML-DSA TLS code points (RFC 9881) Chrome offers */
+#ifndef SSL_SIGN_ML_DSA_44
+#define SSL_SIGN_ML_DSA_44 0x0904
+#define SSL_SIGN_ML_DSA_65 0x0905
+#define SSL_SIGN_ML_DSA_87 0x0906
+#endif
 
 static const struct {
   uint16_t signature_algorithm;
@@ -2575,7 +2582,7 @@ static const char *tls_rt_type(int type)
   }
 }
 
-#ifdef OPENSSL_IS_BORINGSSL
+#ifdef HAVE_BORINGSSL_LIKE
 
 #ifdef HAVE_LIBZ
 int DecompressZlibCert(SSL *ssl,
@@ -2587,6 +2594,7 @@ int DecompressZlibCert(SSL *ssl,
   z_stream strm;
   uint8_t* data;
   CRYPTO_BUFFER* decompressed = CRYPTO_BUFFER_alloc(&data, uncompressed_len);
+  (void)ssl;
   if(!decompressed) {
     return 0;
   }
@@ -2595,9 +2603,9 @@ int DecompressZlibCert(SSL *ssl,
   strm.zfree = NULL;
   strm.opaque = NULL;
   strm.next_in = (Bytef *)in;
-  strm.avail_in = in_len;
+  strm.avail_in = (uInt)in_len;
   strm.next_out = (Bytef *)data;
-  strm.avail_out = uncompressed_len;
+  strm.avail_out = (uInt)uncompressed_len;
 
   if(inflateInit(&strm) != Z_OK) {
     CRYPTO_BUFFER_free(decompressed);
@@ -2630,6 +2638,7 @@ int DecompressBrotliCert(SSL* ssl,
                          size_t in_len) {
   uint8_t* data;
   CRYPTO_BUFFER* decompressed = CRYPTO_BUFFER_alloc(&data, uncompressed_len);
+  (void)ssl;
   if (!decompressed) {
     return 0;
   }
@@ -2657,6 +2666,7 @@ int DecompressZstdCert(SSL* ssl,
   size_t result;
   uint8_t* data;
   CRYPTO_BUFFER* decompressed = CRYPTO_BUFFER_alloc(&data, uncompressed_len);
+  (void)ssl;
   if (!decompressed) {
     return 0;
   }
@@ -2689,6 +2699,9 @@ static struct {
   {"brotli", TLSEXT_cert_compression_brotli, NULL, DecompressBrotliCert},
 #endif
 #ifdef HAVE_ZSTD
+#ifndef TLSEXT_cert_compression_zstd
+#define TLSEXT_cert_compression_zstd 3
+#endif
   {"zstd", TLSEXT_cert_compression_zstd, NULL, DecompressZstdCert},
 #endif
 };
@@ -2758,7 +2771,7 @@ static CURLcode add_cert_compression(struct Curl_easy *data,
 }
 #endif
 
-#endif /* OPENSSL_IS_BORINGSSL */
+#endif /* HAVE_BORINGSSL_LIKE */
 
 /*
  * Our callback from the SSL/TLS layers.
@@ -4171,7 +4184,7 @@ static CURLcode ossl_init_ssl(struct ossl_ctx *octx,
                               void *ssl_user_data,
                               Curl_ossl_init_session_reuse_cb *sess_reuse_cb)
 {
-#ifdef OPENSSL_IS_BORINGSSL
+#ifdef HAVE_BORINGSSL_LIKE
   struct ssl_connect_data *connssl = cf->ctx;
   const struct alpn_spec *alps = NULL;
 #endif
@@ -4187,7 +4200,7 @@ static CURLcode ossl_init_ssl(struct ossl_ctx *octx,
 
   SSL_set_app_data(octx->ssl, ssl_user_data);
 
-#ifdef OPENSSL_IS_BORINGSSL
+#ifdef HAVE_BORINGSSL_LIKE
   if(data->set.ssl_enable_alps) {
     if(peer->transport == TRNSPRT_QUIC)
       alps = alpns_requested;
@@ -4205,7 +4218,8 @@ static CURLcode ossl_init_ssl(struct ossl_ctx *octx,
     for(i = 0; i < alps->count; ++i) {
       /* curl-impersonate: Add the ALPS extension like Chrome does. */
       /* Firefox does not enable this. */
-      SSL_add_application_settings(octx->ssl, alps->entries[i],
+      SSL_add_application_settings(octx->ssl,
+                                   (const uint8_t *)alps->entries[i],
                                    strlen(alps->entries[i]), NULL,
                                    0);
     }
@@ -4580,7 +4594,7 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
   /* We do retry writes sometimes from another buffer address */
   SSL_CTX_set_mode(octx->ssl_ctx, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 
-#ifdef OPENSSL_IS_BORINGSSL
+#ifdef HAVE_BORINGSSL_LIKE
   SSL_CTX_set_options(octx->ssl_ctx, SSL_OP_LEGACY_SERVER_CONNECT);
   SSL_CTX_set_mode(octx->ssl_ctx,
                    SSL_MODE_CBC_RECORD_SPLITTING |
@@ -4659,7 +4673,7 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
   }
 
 #if defined(HAVE_SSL_CTX_SET1_SIGALGS) && \
-  !defined(OPENSSL_IS_BORINGSSL)
+  !defined(HAVE_SSL_CTX_SET_VERIFY_ALGORITHM_PREFS)
 #define OSSL_SIGALG_CAST(x) OSSL_CURVE_CAST(x)
   {
     const char *signature_algorithms =
@@ -4683,10 +4697,10 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
     const char *signature_algorithms =
       Curl_ssl_config_get_signature_algorithms(conn_config, peer->transport);
     if(signature_algorithms) {
-      CURLcode result = parse_sig_algs(data, signature_algorithms, algs,
-                                       &nalgs);
-      if(result)
-        return result;
+      CURLcode sigresult = parse_sig_algs(data, signature_algorithms, algs,
+                                          &nalgs);
+      if(sigresult)
+        return sigresult;
     }
     else {
       memcpy(algs, default_sig_algs, sizeof(default_sig_algs));
@@ -4704,7 +4718,7 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
   }
 #endif
 
-#ifdef OPENSSL_IS_BORINGSSL
+#ifdef HAVE_BORINGSSL_LIKE
   /* curl-impersonate:
    * Configure BoringSSL to behave like Chrome.
    * See Constructor of SSLContext at net/socket/ssl_client_socket_impl.cc
@@ -4717,12 +4731,14 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
   else if(data->set.tls_grease)
     SSL_CTX_set_grease_enabled(octx->ssl_ctx, 1);
 
+#ifdef OPENSSL_IS_BORINGSSL
   if(conn_config->trust_anchors) {
     CURLcode result = set_trust_anchors(data, octx->ssl_ctx,
                                         conn_config->trust_anchors);
     if(result)
       return result;
   }
+#endif
 
   /*
    * curl-impersonate: Enable TLS extension permutation, enabled by default
@@ -4737,6 +4753,7 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
      peer->transport == TRNSPRT_QUIC)
     SSL_CTX_set_permute_extensions(octx->ssl_ctx, 1);
 
+#ifdef OPENSSL_IS_BORINGSSL
   /* curl-impersonate: Set TLS extensions order. */
   {
     const char *extension_order = Curl_ssl_config_get_tls_extension_order(
@@ -4766,13 +4783,14 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
     SSL_CTX_set_key_usage_check_enabled(octx->ssl_ctx, 0);
   else
     SSL_CTX_set_key_usage_check_enabled(octx->ssl_ctx, 1);
+#endif
 
   if(conn_config->cert_compression && conn_config->cert_compression[0] &&
      add_cert_compression(data,
                           octx->ssl_ctx,
                           conn_config->cert_compression))
     return CURLE_SSL_CIPHER;
-#endif /* OPENSSL_IS_BORINGSSL */
+#endif /* HAVE_BORINGSSL_LIKE */
   /* OpenSSL always tries to verify the peer. By setting the failure mode
    * to NONE, we allow the connect to complete, regardless of the outcome.
    * We then explicitly check the result and may try alternatives like
