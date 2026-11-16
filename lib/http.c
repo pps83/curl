@@ -2114,7 +2114,6 @@ void Curl_http_method(struct Curl_easy *data,
  */
 CURLcode Curl_http_merge_headers(struct Curl_easy *data)
 {
-  int i;
   int ret;
   struct curl_slist *head;
   struct curl_slist *dup = NULL;

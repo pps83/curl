@@ -107,8 +107,8 @@ static bool http_header_order_name_char(char c)
 }
 
 /* Parse one comma-separated header name and trim surrounding blanks. */
-static void http_header_order_token(const char **pp, const char **pname,
-                                    size_t *pnamelen)
+static void setopt_header_order_token(const char **pp, const char **pname,
+                                      size_t *pnamelen)
 {
   const char *p = *pp;
   const char *name;
@@ -136,7 +136,7 @@ static bool http_header_order_duplicate(const char *order,
   while(p < name) {
     const char *prev;
     size_t prevlen;
-    http_header_order_token(&p, &prev, &prevlen);
+    setopt_header_order_token(&p, &prev, &prevlen);
     if(prevlen == namelen && curl_strnequal(prev, name, namelen))
       return TRUE;
     if(*p == ',') {
@@ -163,7 +163,7 @@ static bool setopt_valid_http_header_order(const char *order)
     const char *name;
     size_t namelen;
     size_t i;
-    http_header_order_token(&p, &name, &namelen);
+    setopt_header_order_token(&p, &name, &namelen);
     if(!namelen || name[0] == ':' ||
        http_header_order_duplicate(order, name, namelen))
       return FALSE;
