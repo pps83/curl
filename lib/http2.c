@@ -314,6 +314,7 @@ static CURLcode cf_h2_update_settings(struct cf_h2_ctx *ctx,
   return CURLE_OK;
 }
 
+#if 0 /* the only call, below, is commented out */
 /* HTTP/2 priorities are deprecated, but retain this helper for Firefox
  * impersonation profiles which use the legacy priority tree. */
 static CURLcode http2_set_stream_priority(struct Curl_cfilter *cf,
@@ -408,6 +409,7 @@ malformed:
   curlx_free(copy);
   return CURLE_BAD_FUNCTION_ARGUMENT;
 }
+#endif
 
 #define H2_STREAM_CTX(ctx, data)                                         \
   ((struct h2_stream_ctx *)(                                             \

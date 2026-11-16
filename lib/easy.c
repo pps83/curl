@@ -384,13 +384,10 @@ static CURLcode _do_impersonate(struct Curl_easy *data,
   }
 
   // Prefer user set versions
-  long selected_http_version;
   if (data->set.httpwant != CURL_HTTP_VERSION_NONE) {
-    ret = curl_easy_setopt(data, CURLOPT_HTTP_VERSION, data->set.httpwant);
-    selected_http_version = data->set.httpwant;
+    ret = curl_easy_setopt(data, CURLOPT_HTTP_VERSION, (long)data->set.httpwant);
   } else {
-    ret = curl_easy_setopt(data, CURLOPT_HTTP_VERSION, opts->httpversion);
-    selected_http_version = opts->httpversion;
+    ret = curl_easy_setopt(data, CURLOPT_HTTP_VERSION, (long)opts->httpversion);
   }
 
   if(ret)
@@ -400,7 +397,7 @@ static CURLcode _do_impersonate(struct Curl_easy *data,
   // QUIC inherently uses TLS 1.3, enforced in the QUIC TLS setup.
   if(!data->set.ssl_version_set &&
      (opts->ssl_version != CURL_SSLVERSION_DEFAULT)) {
-    ret = curl_easy_setopt(data, CURLOPT_SSLVERSION, opts->ssl_version);
+    ret = curl_easy_setopt(data, CURLOPT_SSLVERSION, (long)opts->ssl_version);
     if(ret)
       return ret;
   }
@@ -439,20 +436,20 @@ static CURLcode _do_impersonate(struct Curl_easy *data,
   }
 
   // TODO: remove npn, which has been deprecated by curl
-  ret = curl_easy_setopt(data, CURLOPT_SSL_ENABLE_NPN, opts->npn ? 1 : 0);
+  ret = curl_easy_setopt(data, CURLOPT_SSL_ENABLE_NPN, opts->npn ? 1L : 0L);
   if(ret)
     return ret;
 
-  ret = curl_easy_setopt(data, CURLOPT_SSL_ENABLE_ALPN, opts->alpn ? 1 : 0);
+  ret = curl_easy_setopt(data, CURLOPT_SSL_ENABLE_ALPN, opts->alpn ? 1L : 0L);
   if(ret)
     return ret;
 
-  ret = curl_easy_setopt(data, CURLOPT_SSL_ENABLE_ALPS, opts->alps ? 1 : 0);
+  ret = curl_easy_setopt(data, CURLOPT_SSL_ENABLE_ALPS, opts->alps ? 1L : 0L);
   if(ret)
     return ret;
 
   ret = curl_easy_setopt(data, CURLOPT_SSL_ENABLE_TICKET,
-                         opts->tls_session_ticket ? 1 : 0);
+                         opts->tls_session_ticket ? 1L : 0L);
   if(ret)
     return ret;
 
@@ -463,12 +460,12 @@ static CURLcode _do_impersonate(struct Curl_easy *data,
   }
 
   // always enable this for browsers
-  ret = curl_easy_setopt(data, CURLOPT_TLS_SIGNED_CERT_TIMESTAMPS, 1);
+  ret = curl_easy_setopt(data, CURLOPT_TLS_SIGNED_CERT_TIMESTAMPS, 1L);
   if(ret)
     return ret;
 
   // always enable this for browsers
-  ret = curl_easy_setopt(data, CURLOPT_TLS_STATUS_REQUEST, 1);
+  ret = curl_easy_setopt(data, CURLOPT_TLS_STATUS_REQUEST, 1L);
   if(ret)
     return ret;
 
@@ -480,7 +477,7 @@ static CURLcode _do_impersonate(struct Curl_easy *data,
   }
 
   if(opts->tls_permute_extensions) {
-    ret = curl_easy_setopt(data, CURLOPT_SSL_PERMUTE_EXTENSIONS, 1);
+    ret = curl_easy_setopt(data, CURLOPT_SSL_PERMUTE_EXTENSIONS, 1L);
     if(ret)
       return ret;
   }
@@ -606,7 +603,7 @@ static CURLcode _do_impersonate(struct Curl_easy *data,
   }
 
   if(opts->http2_window_update) {
-    ret = curl_easy_setopt(data, CURLOPT_HTTP2_WINDOW_UPDATE, opts->http2_window_update);
+    ret = curl_easy_setopt(data, CURLOPT_HTTP2_WINDOW_UPDATE, (long)opts->http2_window_update);
     if(ret)
       return ret;
   }
@@ -618,7 +615,7 @@ static CURLcode _do_impersonate(struct Curl_easy *data,
   }
 
   if(opts->http2_no_priority) {
-    ret = curl_easy_setopt(data, CURLOPT_HTTP2_NO_PRIORITY, opts->http2_no_priority);
+    ret = curl_easy_setopt(data, CURLOPT_HTTP2_NO_PRIORITY, (long)opts->http2_no_priority);
     if(ret)
       return ret;
   }
@@ -629,7 +626,7 @@ static CURLcode _do_impersonate(struct Curl_easy *data,
       return ret;
   }
 
-  ret = curl_easy_setopt(data, CURLOPT_TLS_GREASE, opts->tls_grease);
+  ret = curl_easy_setopt(data, CURLOPT_TLS_GREASE, (long)opts->tls_grease);
   if(ret)
     return ret;
 
@@ -654,37 +651,37 @@ static CURLcode _do_impersonate(struct Curl_easy *data,
   }
 
   if(opts->tls_record_size_limit) {
-    ret = curl_easy_setopt(data, CURLOPT_TLS_RECORD_SIZE_LIMIT, opts->tls_record_size_limit);
+    ret = curl_easy_setopt(data, CURLOPT_TLS_RECORD_SIZE_LIMIT, (long)opts->tls_record_size_limit);
     if(ret)
       return ret;
   }
 
   if(opts->tls_key_shares_limit) {
-    ret = curl_easy_setopt(data, CURLOPT_TLS_KEY_SHARES_LIMIT, opts->tls_key_shares_limit);
+    ret = curl_easy_setopt(data, CURLOPT_TLS_KEY_SHARES_LIMIT, (long)opts->tls_key_shares_limit);
     if(ret)
       return ret;
   }
 
   if(opts->tls_use_new_alps_codepoint) {
-    ret = curl_easy_setopt(data, CURLOPT_TLS_USE_NEW_ALPS_CODEPOINT, opts->tls_use_new_alps_codepoint);
+    ret = curl_easy_setopt(data, CURLOPT_TLS_USE_NEW_ALPS_CODEPOINT, (long)opts->tls_use_new_alps_codepoint);
     if(ret)
       return ret;
   }
 
   if(opts->http2_stream_weight) {
-    ret = curl_easy_setopt(data, CURLOPT_STREAM_WEIGHT, opts->http2_stream_weight);
+    ret = curl_easy_setopt(data, CURLOPT_STREAM_WEIGHT, (long)opts->http2_stream_weight);
     if(ret)
       return ret;
   }
 
   if(opts->http2_stream_exclusive) {
-    ret = curl_easy_setopt(data, CURLOPT_STREAM_EXCLUSIVE, opts->http2_stream_exclusive);
+    ret = curl_easy_setopt(data, CURLOPT_STREAM_EXCLUSIVE, (long)opts->http2_stream_exclusive);
     if(ret)
       return ret;
   }
 
   if(opts->proxy_credential_no_reuse) {
-    ret = curl_easy_setopt(data, CURLOPT_PROXY_CREDENTIAL_NO_REUSE, opts->proxy_credential_no_reuse);
+    ret = curl_easy_setopt(data, CURLOPT_PROXY_CREDENTIAL_NO_REUSE, (long)opts->proxy_credential_no_reuse);
     if(ret)
       return ret;
   }
@@ -726,7 +723,7 @@ CURLcode curl_easy_impersonate_customized(struct Curl_easy *data,
 static const struct impersonate_opts *binary_search(size_t size, const char *key)
 {
   int low = 0;
-  int high = size - 1;
+  int high = (int)size - 1;
 
   while(low <= high) {
     int mid = low + (high - low) / 2;
