@@ -774,7 +774,7 @@
 #ifdef _WIN64
 #define ssize_t __int64
 #else
-#define ssize_t long
+#define ssize_t int
 #endif
 
 /* Define to 1 if you have the mach_absolute_time function. */

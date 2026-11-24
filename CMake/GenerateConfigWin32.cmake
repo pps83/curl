@@ -19,6 +19,8 @@ file(READ ${build}/Win32/lib/curl_config.h config32)
 file(REMOVE_RECURSE ${build})
 string(REPLACE "\r" "" config "${config}")
 string(REPLACE "\r" "" config32 "${config32}")
+# CMake takes long for Win32 as it has size_t's size, but MSVC's size_t is unsigned int, which %zd prints as int
+string(REPLACE "#define ssize_t long" "#define ssize_t int" config32 "${config32}")
 string(REGEX MATCHALL "#define [A-Za-z0-9_]+[^\n]*" defines64 "${config}")
 string(REGEX MATCHALL "#define [A-Za-z0-9_]+[^\n]*" defines32 "${config32}")
 list(LENGTH defines64 count64)
