@@ -247,7 +247,7 @@ static CURLcode parse_sig_algs(struct Curl_easy *data,
 {
   *nalgs = 0;
   while(sigalgs && sigalgs[0]) {
-    int i;
+    size_t i;
     bool found = FALSE;
     const char *end;
     size_t len;
@@ -2719,7 +2719,7 @@ static CURLcode add_cert_compression(struct Curl_easy *data,
                                      SSL_CTX *ctx,
                                      const char *algorithms)
 {
-  int i;
+  size_t i;
   const char *s = algorithms;
   char *alg_name;
   size_t alg_name_len;

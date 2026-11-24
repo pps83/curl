@@ -5461,7 +5461,7 @@ CURLcode Curl_http_req_to_h2(struct dynhds *h2_headers,
 
   // curl-impersonate: Use the Chrome ordering by default:
   // :method, :authority, :scheme, :path
-  char *order = "masp";
+  const char *order = "masp";
 
   DEBUGASSERT(req);
   DEBUGASSERT(h2_headers);

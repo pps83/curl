@@ -757,7 +757,7 @@ CURLcode curl_easy_impersonate(CURL *data, const char *target,
 
   // If not found, fallback and search by alias again
   if(opts == NULL) {
-    for(int i = 0; i < num_impersonations; ++i) {
+    for(size_t i = 0; i < num_impersonations; ++i) {
       if (curl_strequal(target, impersonations[i].alias)) {
         opts = impersonations + i;
         break;
